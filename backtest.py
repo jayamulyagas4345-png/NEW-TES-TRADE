@@ -970,6 +970,7 @@ def summarize(rows, args, pairs, steps, n_open_end, errs):
     if EXP_SINGLE_TP:
         _cfg += f" | SINGLE_TP={bot.RR_GRADE_B:g}R (tanpa partial)"
     _cfg += f" | adx_max={getattr(bot, 'TREND_GATE_ADX_MAX', 0):g} fvg_only_block={'ON' if getattr(bot, 'ENTRY_BLOCK_FVG_ONLY', False) else 'OFF'}"
+    _cfg += f" | struct_filter={'ON' if getattr(bot, 'STRUCT_FILTER_LTF', False) else 'OFF'} sl_buffer={getattr(bot, 'SL_BUFFER_ATR_MULT', 0):g}xATR dirs={'+'.join(sorted(getattr(bot, 'EDGE_ALLOWED_DIRS', [])))}"
     L.append(f"Config    : {_cfg}")
     if getattr(args, "random_entry", False):
         L.append(f"MODE      : *** BASELINE ACAK *** seed={args.seed} prob={args.rand_prob:g} "
@@ -1090,6 +1091,10 @@ def main():
                     help="stop scan sisa hari UTC bila PnL harian <= -X%% modal awal (0 = off)")
     ap.add_argument("--daily-win-pct", type=float, default=0.0,
                     help="stop scan sisa hari UTC bila PnL harian >= +X%% modal awal (0 = off)")
+    ap.add_argument("--struct-filter", type=int, default=0,
+                    help="1 = nyalakan main.STRUCT_FILTER_LTF (HH+HL / LH+LL, belum CHoCH di entry TF). 0 = ikut file")
+    ap.add_argument("--sl-buffer", type=float, default=0.0,
+                    help="override main.SL_BUFFER_ATR_MULT (buffer SL di luar zona, x ATR; mis. 0.3). 0 = ikut file")
     ap.add_argument("--weekly-loss-pct", type=float, default=0.0,
                     help="stop scan sisa minggu (ISO) bila PnL mingguan <= -X%% modal awal (0 = off)")
     ap.add_argument("--monthly-loss-pct", type=float, default=0.0,
@@ -1129,6 +1134,10 @@ def main():
     if args.ema_pullback == "gate":
         bot.EMA_PULLBACK_MODE = "GATE"
     global FLIP, EXP_BE_AT_R
+    if args.struct_filter:
+        bot.STRUCT_FILTER_LTF = True
+    if args.sl_buffer and args.sl_buffer > 0:
+        bot.SL_BUFFER_ATR_MULT = float(args.sl_buffer)
     if args.be_at_r and args.be_at_r > 0:
         EXP_BE_AT_R = float(args.be_at_r)
     if args.flip:
