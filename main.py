@@ -572,7 +572,7 @@ RISK_PER_TRADE   = 0.30          # 30% balance per trade — modal $50: 30%×15x
 #         max_loss=$100, lot=$100/($200×2%)=$100/$4=25 unit
 # Lot boleh berapa saja selama potensi loss jika SL kena ≤ MAX_SL_LOSS_PCT × balance.
 # Ganti persentase di bawah atau via /setmarginratio (misal 1 → maks rugi 1% dari balance)
-MAX_SL_LOSS_PCT  = 0.01              # 1% dari total balance sebagai max loss per trade jika SL kena
+MAX_SL_LOSS_PCT  = 0.005             # 0.5% dari total balance sebagai max loss per trade jika SL kena (v-limits 2026-11-17; /setmarginratio 0.5)
 MARGIN_RATIO     = MAX_SL_LOSS_PCT   # alias backward-compat (dipakai di beberapa tempat lain)
 MARGIN_SAFETY_FACTOR = 0.95          # sisakan 5% available balance sebagai buffer (fee, slippage, posisi lain)
 MAX_OPEN_TRADES  = 1             # modal <$100 → max 1 posisi saja. Naik otomatis saat saldo bertambah
@@ -796,8 +796,17 @@ bot_paused = True
 # Set via /maxdailyloss dan /maxdailywin (dalam % dari total portfolio)
 # 0.0 = tidak aktif (tidak ada limit)
 # Contoh: 5.0 = bot auto-pause jika daily PnL mencapai -5% (loss) atau +5% (win)
-DAILY_LOSS_LIMIT_PCT: float = 0.0   # % max daily loss dari total portfolio (0 = off)
-DAILY_WIN_LIMIT_PCT:  float = 0.0   # % max daily win dari total portfolio (0 = off)
+DAILY_LOSS_LIMIT_PCT: float = 2.0   # % max daily loss dari total portfolio (0 = off)  [v-limits: 2%; bot_state.json bisa menimpa → cek /maxdailyloss]
+DAILY_WIN_LIMIT_PCT:  float = 2.0   # % max daily win dari total portfolio (0 = off)  [v-limits: 2%; bot_state.json bisa menimpa → cek /maxdailywin]
+
+# ── Limit MINGGUAN & BULANAN (v-limits 2026-11-17) ───────────────────────────
+# Dihitung dari balance awal minggu (Senin 00:00 UTC) / awal bulan (tgl 1 00:00 UTC), sama seperti
+# daily limit (balance-based; deposit/withdraw ikut terhitung). Kena limit → bot PAUSE sampai periode
+# berikutnya lalu auto-start. 0 = nonaktif. Diatur lewat file ini (tidak lewat Telegram).
+# CATATAN: pada start pertama, baseline minggu/bulan = balance saat bot pertama kali dicek.
+WEEKLY_LOSS_LIMIT_PCT:  float = 4.0   # pause sampai Senin depan kalau PnL minggu ini <= -4%
+MONTHLY_LOSS_LIMIT_PCT: float = 6.0   # pause sampai bulan depan kalau PnL bulan ini <= -6%
+MONTHLY_WIN_LIMIT_PCT:  float = 8.0   # pause sampai bulan depan kalau PnL bulan ini >= +8% (kunci profit)
 
 # State untuk tracking daily limit
 # "date"          : tanggal UTC terakhir cek (format "YYYY-MM-DD")
@@ -818,7 +827,7 @@ _daily_limit_state: dict = {
 # yang di-cancel / expired / ditolak saldo TIDAK memakai jatah.
 # Cek saat kirim order: terisi_hari_ini + pending_limit_orders >= batas -> skip,
 # supaya limit order yang masih menunggu fill tidak bisa menembus batas.
-MAX_TRADES_PER_DAY: int = 0
+MAX_TRADES_PER_DAY: int = 3   # v-limits: anti over-trade (bot_state.json bisa menimpa → cek /maxtradesperday)
 _trades_today_state: dict = {"date": None, "count": 0}
 _trades_today_lock = threading.Lock()
 
@@ -5764,7 +5773,7 @@ TREND_GATE_ON         = True
 # True  = langsung skip (hemat juga 1 panggilan API). False = perilaku lama (adaptive).
 # Dasar: backtest 13 Sep–8 Okt 2026, 3 trade RANGING → 1 menang, total -20 USDT (sampel kecil).
 BLOCK_HTF_RANGING     = True
-TREND_GATE_ADX_MIN    = 0.0  
+TREND_GATE_ADX_MIN    = 20.0
 TREND_GATE_DI_ALIGN   = True
 
 # ── EDGE FILTER (2026-11-11, v70) ───────────────────────────────────────────
@@ -5782,7 +5791,7 @@ TREND_GATE_DI_ALIGN   = True
 # live. Matikan lewat BOT_OVERRIDES di backtest.py untuk A/B test:
 #   TREND_GATE_ADX_MAX = 0            → cap ADX nonaktif
 #   ENTRY_BLOCK_FVG_ONLY = False      → entry FVG-saja boleh lagi
-TREND_GATE_ADX_MAX    = 0.0    # skip kalau ADX(HTF) > nilai ini (0 = nonaktif)
+TREND_GATE_ADX_MAX    = 32.0   # skip kalau ADX(HTF) > nilai ini (0 = nonaktif)
 ENTRY_BLOCK_FVG_ONLY  = True   # skip kalau harga di FVG tapi TIDAK di OB
 
 # ── LOSS-DRIVER FILTERS (2026-11-17) — dari analisa 2 backtest log (n=17, SHORT semua) ──
@@ -5790,22 +5799,6 @@ ENTRY_BLOCK_FVG_ONLY  = True   # skip kalau harga di FVG tapi TIDAK di OB
 # SAMPEL KECIL & belum tervalidasi — A/B dulu lewat BOT_OVERRIDES di backtest.py (100+ trade)
 # sebelum live. Matikan: TREND_GATE_DI_MIN = 0 / SHORT_RSI_MAX_ENTRY = 0.
 TREND_GATE_DI_MIN     = 0.0    # skip kalau kekuatan DI gap HTF (searah trade) < nilai ini (0 = nonaktif)
-# ── MODE RISET (2026-11-17) — HANYA UNTUK BACKTEST, JANGAN DIPAKAI LIVE ──────────────────────
-# True = semua gate pemfilter dimatikan (RANGING block + LTF-score gate, trend gate ADX/DI, slow trend,
-# HTF structure, edge filter [arah/ATR/pair], FVG-only, entry-zone) supaya jumlah sampel besar.
-# Nilai tiap gate TETAP dicatat ke CSV (adx_htf, di_gap_htf, ema_gap_htf, atr_pct, htf_bias,
-# htf_struct_ok, htf_er, sl_source=OB/FVG/SWING) untuk dinilai belakangan. Yang TETAP aktif: skor minimum,
-# BOS NONE, volatilitas minimum, cooldown sinyal per pair, posisi aktif per pair.
-RESEARCH_MODE         = True
-# ── MODE LEAN (2026-11-17) — aturan sederhana hasil analisa 4 periode riset (772 trade) ─────────
-# Di atas RESEARCH_MODE (semua gate lama mati), LEAN_MODE menyalakan lagi HANYA 3 aturan, simetris
-# untuk LONG dan SHORT (jadi di bull market otomatis kebalik):
-#   1) slow trend searah  : SHORT hanya kalau EMA50 HTF <= EMA200 HTF, LONG kebalikannya
-#   2) DI searah          : -DI > +DI untuk SHORT, +DI > -DI untuk LONG
-#   3) entry wajib di zona OB/FVG (tanpa zona = skip)
-# Gate ADX/ATR/RANGING/struktur/FVG-saja SENGAJA mati (tidak terbukti membantu di data riset).
-# LONG ikut boleh (EDGE_ALLOWED_DIRS di-bypass) tapi di 4 periode tahun 2026 (bear) belum terbukti.
-LEAN_MODE             = True
 SHORT_RSI_MAX_ENTRY   = 0.0    # skip SHORT kalau RSI entry >= nilai ini (pullback, bukan lanjut turun; 0 = nonaktif)
 
 # ── PULLBACK EMA 20/50 (2026-11-15) — entry hanya saat harga kembali ke area EMA searah tren ──
@@ -15367,7 +15360,7 @@ def _reset_daily_limit_for_new_day():
     print(f"📅 Daily limit reset — {today} | Balance open: {new_balance_open:.2f} USDT")
 
     # ── Auto-start hanya jika kemarin kena limit (BUKAN pause manual) ────────
-    if paused_by_prev in ("DAILY_LOSS", "DAILY_WIN", "DRAWDOWN") and bot_paused:
+    if paused_by_prev in ("DAILY_LOSS", "DAILY_WIN", "DRAWDOWN") and bot_paused and not _daily_limit_state.get("period_pause_kind"):
         bot_paused = False
         _daily_limit_state["auto_started"] = True
         limit_label = {"DAILY_LOSS": "Daily Loss", "DAILY_WIN": "Daily Win", "DRAWDOWN": "Drawdown"}.get(paused_by_prev, "Limit")
@@ -15464,6 +15457,90 @@ def check_daily_limits():
 
 
 
+
+
+def _period_keys() -> tuple[str, str]:
+    """(week_id, month_id) UTC. Minggu mulai Senin 00:00 UTC (ISO week)."""
+    n = datetime.now(timezone.utc)
+    iso = n.isocalendar()
+    return f"{iso[0]}-W{iso[1]:02d}", n.strftime("%Y-%m")
+
+
+def check_period_limits():
+    """
+    Limit MINGGUAN (loss) dan BULANAN (loss + profit target). Dipanggil tiap iterasi setelah
+    check_daily_limits(). Kena limit → bot_paused=True sampai periode berikutnya, lalu auto-start.
+    State disimpan di _daily_limit_state (ikut tersimpan ke bot_state.json).
+    """
+    global bot_paused
+
+    if WEEKLY_LOSS_LIMIT_PCT <= 0 and MONTHLY_LOSS_LIMIT_PCT <= 0 and MONTHLY_WIN_LIMIT_PCT <= 0:
+        return
+    try:
+        cur = get_total_balance()
+    except Exception:
+        return
+    if cur is None or cur <= 0:
+        return   # API error → jangan pause
+
+    st = _daily_limit_state
+    wk, mo = _period_keys()
+
+    # ── Periode baru: snapshot balance awal + auto-resume kalau pause-nya milik periode lama ──
+    resumed = None
+    if st.get("week_id") != wk:
+        st["week_id"] = wk
+        st["week_balance_open"] = cur
+        if st.get("period_pause_kind") == "WEEKLY_LOSS":
+            resumed = "Weekly Loss"
+            st["period_pause_kind"] = None
+    if st.get("month_id") != mo:
+        st["month_id"] = mo
+        st["month_balance_open"] = cur
+        if st.get("period_pause_kind") in ("MONTHLY_LOSS", "MONTHLY_WIN"):
+            resumed = "Monthly Loss" if st.get("period_pause_kind") == "MONTHLY_LOSS" else "Monthly Win"
+            st["period_pause_kind"] = None
+    if resumed and bot_paused:
+        bot_paused = False
+        print(f"▶️ Bot auto-start: periode baru, limit {resumed} sudah direset")
+        send_telegram_raw(
+            f"☀️ <b>Periode Baru — Bot Auto-Start</b>\n"
+            f"{'─'*34}\n"
+            f"🔄 Limit <b>{resumed}</b> sebelumnya sudah direset.\n"
+            f"💰 Balance open minggu: <b>{st.get('week_balance_open', 0):.2f}</b> | bulan: <b>{st.get('month_balance_open', 0):.2f}</b> USDT\n"
+            f"Bot scanning & trading aktif kembali!"
+        )
+
+    if st.get("period_pause_kind"):
+        return   # sudah di-pause oleh limit periode ini
+
+    wo = st.get("week_balance_open") or 0.0
+    mob = st.get("month_balance_open") or 0.0
+    wpct = (cur - wo) / wo * 100.0 if wo > 0 else 0.0
+    mpct = (cur - mob) / mob * 100.0 if mob > 0 else 0.0
+
+    kind = None
+    if WEEKLY_LOSS_LIMIT_PCT > 0 and wpct <= -WEEKLY_LOSS_LIMIT_PCT:
+        kind, title, pct, lim, until = "WEEKLY_LOSS", "🛑 WEEKLY LOSS LIMIT TERCAPAI", wpct, f"-{WEEKLY_LOSS_LIMIT_PCT:.1f}%", "Senin depan (UTC 00:00)"
+    elif MONTHLY_LOSS_LIMIT_PCT > 0 and mpct <= -MONTHLY_LOSS_LIMIT_PCT:
+        kind, title, pct, lim, until = "MONTHLY_LOSS", "🛑 MONTHLY LOSS LIMIT TERCAPAI", mpct, f"-{MONTHLY_LOSS_LIMIT_PCT:.1f}%", "tanggal 1 bulan depan (UTC 00:00)"
+    elif MONTHLY_WIN_LIMIT_PCT > 0 and mpct >= MONTHLY_WIN_LIMIT_PCT:
+        kind, title, pct, lim, until = "MONTHLY_WIN", "🎯 MONTHLY PROFIT TARGET TERCAPAI", mpct, f"+{MONTHLY_WIN_LIMIT_PCT:.1f}%", "tanggal 1 bulan depan (UTC 00:00)"
+
+    if kind:
+        bot_paused = True
+        st["period_pause_kind"] = kind
+        print(f"{title}: {pct:+.2f}% (limit {lim}) → bot PAUSED sampai {until}")
+        send_telegram_raw(
+            f"{title} — Bot Di-PAUSE\n"
+            f"{'─'*38}\n"
+            f"💰 Balance Sekarang : <b>{cur:.2f} USDT</b>\n"
+            f"📊 PnL Periode      : <b>{pct:+.2f}%</b> (limit {lim})\n"
+            f"{'─'*38}\n"
+            f"⏸ <b>Bot otomatis PAUSE sampai {until}.</b>\n"
+            f"🔄 Bot akan auto-start di periode berikutnya.\n"
+            f"ℹ️ Gunakan /resumeorpause jika ingin resume manual."
+        )
 
 
 def send_message_with_keyboard(text: str, keyboard: list):
@@ -15722,7 +15799,7 @@ def cmd_backtest(parts):
             _tok = parts[4].strip().lower()
             # Token ke-5 boleh langsung opsi (sr1.2 / pb / dl5 / dw5 / mt3) tanpa
             # harus isi mode strategi — mode default (SMC bot) dipakai.
-            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt)\d+(?:\.\d+)?", _tok):
+            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk)\d+(?:\.\d+)?", _tok):
                 parts = list(parts[:4]) + ["-"] + list(parts[4:])
                 _tok = "-"
             _m = _re.fullmatch(r"(rand|randsmc)(\d*)", _tok)
@@ -15793,10 +15870,10 @@ def cmd_backtest(parts):
                     extra_args += ["--ema-pullback", "gate"]
                     mode_label += " pb"
                     continue
-                _lm = _re.fullmatch(r"(dl|dw|mt)(\d+(?:\.\d+)?)", _x.strip().lower())
+                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk)(\d+(?:\.\d+)?)", _x.strip().lower())
                 if not _lm:
                     raise ValueError("limit")
-                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day"}[_lm.group(1)]
+                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk"}[_lm.group(1)]
                 _val = _lm.group(2)
                 if _lm.group(1) == "mt":
                     _val = str(int(float(_val)))
@@ -16911,7 +16988,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     htf_bias, htf_event, _, _ = detect_structure(df_htf)
     ranging_ctx = None
 
-    if BLOCK_HTF_RANGING and not RESEARCH_MODE and htf_bias == "RANGING":
+    if BLOCK_HTF_RANGING and htf_bias == "RANGING":
         print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} RANGING (sideways), BLOCK_HTF_RANGING aktif, skip")
         return
 
@@ -16933,7 +17010,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
         ranging_ctx = evaluate_htf_ranging(df_htf, df_entry_pre, htf_event, pair, label)
 
-        if not ranging_ctx.allowed and not (RESEARCH_MODE and getattr(ranging_ctx, "direction", None)):
+        if not ranging_ctx.allowed:
             print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} RANGING, LTF score {ranging_ctx.ltf_score} "
                   f"< gate {LTF_RANGING_SCORE_GATE} (tidak ada bias jelas), skip")
             return
@@ -16973,7 +17050,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     except Exception:
         adx_htf, pdi_htf, ndi_htf = 25.0, 0.0, 0.0
     di_gap_htf = (pdi_htf - ndi_htf) if trade_direction == "BULLISH" else (ndi_htf - pdi_htf)
-    if TREND_GATE_ON and (not RESEARCH_MODE or LEAN_MODE):
+    if TREND_GATE_ON:
         _dir_s = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if TREND_GATE_ADX_MIN > 0 and adx_htf < TREND_GATE_ADX_MIN:
             print(f"  ⛔ [{label}] {pair} {_dir_s} — TREND GATE: ADX {htf_tf} {adx_htf:.1f} "
@@ -17006,23 +17083,20 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 _slow_ok_data = True
     except Exception:
         ema_gap_htf, _slow_ok_data = 0.0, False
-    if SLOW_TREND_GATE_ON and (not RESEARCH_MODE or LEAN_MODE) and _slow_ok_data and ema_gap_htf < 0:
+    if SLOW_TREND_GATE_ON and _slow_ok_data and ema_gap_htf < 0:
         _dir_s2 = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_s2} — SLOW TREND GATE: EMA50 vs EMA200 {htf_tf} "
               f"berlawanan arah trade (gap {ema_gap_htf:+.2f}%), skip")
         return
 
     # ── HTF STRUCTURE GATE (v76) — alt harus breakout/breakdown atau struktur jelas ──
-    _hs_ok, _hs_er = "", ""
-    if HTF_STRUCT_GATE_ON or RESEARCH_MODE:
+    if HTF_STRUCT_GATE_ON:
         try:
             _atr_h = calculate_atr(df_htf)
         except Exception:
             _atr_h = None
         _st_ok, _st_why, _st_info = check_htf_structure(df_htf, trade_direction, _atr_h)
-        _hs_ok = int(bool(_st_ok))
-        _hs_er = round(float(_st_info["er"]), 3) if _st_info.get("er") is not None else ""
-        if not _st_ok and not RESEARCH_MODE:
+        if not _st_ok:
             _dir_s3 = "LONG" if trade_direction == "BULLISH" else "SHORT"
             print(f"  ⛔ [{label}] {pair} {_dir_s3} — HTF STRUCTURE GATE: {_st_why}, skip")
             return
@@ -17058,7 +17132,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     entry_atr_pct = (entry_atr / current_price * 100) if current_price > 0 else 0.0
 
     # ── EDGE FILTER (v77) — arah, volatilitas, pair ──
-    if EDGE_FILTER_ON and not RESEARCH_MODE:
+    if EDGE_FILTER_ON:
         _edge_dir = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if _edge_dir not in EDGE_ALLOWED_DIRS:
             print(f"  ⛔ [{label}] {pair} {_edge_dir} — EDGE FILTER: arah dimatikan, skip")
@@ -17184,12 +17258,12 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     in_fvg       = price_in_fvg(price, fvg)
 
     # EDGE FILTER v70: entry di FVG-saja (tanpa OB) terbukti negatif di backtest.
-    if ENTRY_BLOCK_FVG_ONLY and not RESEARCH_MODE and in_fvg and not in_ob:
+    if ENTRY_BLOCK_FVG_ONLY and in_fvg and not in_ob:
         _dir_s3 = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_s3} — EDGE FILTER: entry zona FVG-saja (tanpa OB), skip")
         return
 
-    if ENTRY_REQUIRE_ZONE and (not RESEARCH_MODE or LEAN_MODE) and not in_ob and not in_fvg:
+    if ENTRY_REQUIRE_ZONE and not in_ob and not in_fvg:
         _dir_z = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_z} — ENTRY ZONE GATE: harga tidak di OB/FVG (entry market), skip")
         return
@@ -17583,8 +17657,6 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         "adx_htf":        round(adx_htf, 2),
         "di_gap_htf":     round(di_gap_htf, 2),
         "ema_gap_htf":    round(ema_gap_htf, 3),
-        "htf_struct_ok":  _hs_ok,
-        "htf_er":         _hs_er,
     })
 
     tier_label = f"{tier}{'(RANGING)' if ranging_ctx else ''}"
@@ -17934,6 +18006,7 @@ def main():
             # ── Cek daily loss/win limit & reset hari baru ────────────────────
             # Dilakukan di setiap iterasi, sebelum cek bot_paused
             check_daily_limits()
+            check_period_limits()
 
             if bot_paused:
                 # ── PAUSED: tidak ada sync posisi sama sekali ─────────────────
