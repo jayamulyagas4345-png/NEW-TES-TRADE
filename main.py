@@ -1147,6 +1147,15 @@ PAIR_LIST = [
 
 # ── Price Action + Supply & Demand + S/R Detection Parameters ───────────────
 SWING_WINDOW          = 5        # candle kiri/kanan untuk swing high/low
+
+# ── FILTER STRUKTUR LTF (v-struct 2026-11-17) ─────────────────────────────────
+# Gate BOS lama (_detect_ltf_bos) cuma cek "ada close di atas/bawah high/low 10 candle terakhir" — bounce kecil
+# di tengah tren lawan bisa lolos. Filter ini menuntut struktur searah di entry TF:
+#   LONG : swing high terbaru > sebelumnya (HH) DAN swing low terbaru > sebelumnya (HL),
+#          dan belum ada close di bawah HL terakhir (belum CHoCH).
+#   SHORT: kebalikannya (LH + LL, belum ada close di atas LH terakhir).
+# False = perilaku lama. Di backtest bisa dinyalakan lewat token Telegram `sf1` (tanpa ganti file).
+STRUCT_FILTER_LTF     = False
 SR_LOOKBACK           = 80       # candle lookback untuk deteksi S/R level
 SR_TOUCH_MIN          = 2        # minimum touch agar level valid
 SR_PROXIMITY_PCT      = 0.003    # 0.3% proximity — harga dianggap "di zona S/R"
@@ -3320,6 +3329,47 @@ def find_swings(df: pd.DataFrame, window: int = SWING_WINDOW) -> tuple:
         if df["low"].iloc[i] == lo_window.min():
             lows.append((i, float(df["low"].iloc[i])))
     return highs, lows
+
+
+def _ltf_structure_ok(df: pd.DataFrame, direction: str) -> tuple:
+    """
+    Filter struktur LTF: (ok: bool, alasan: str).
+    BULLISH butuh HH + HL dan belum CHoCH (tidak ada close di bawah HL terakhir); BEARISH kebalikannya.
+    """
+    try:
+        highs, lows = find_swings(df)
+    except Exception:
+        return True, "swing error (filter diabaikan)"
+
+    def _dedupe(sw):
+        # swing berdekatan (high/low sama di candle bersebelahan) dihitung satu
+        out = []
+        for it in sw:
+            if not out or it[0] - out[-1][0] > SWING_WINDOW:
+                out.append(it)
+        return out
+
+    highs, lows = _dedupe(highs), _dedupe(lows)
+    if len(highs) < 2 or len(lows) < 2:
+        return False, "swing kurang (<2 high/low)"
+    closes = df["close"]
+    if direction == "BULLISH":
+        hh = highs[-1][1] > highs[-2][1]
+        hl = lows[-1][1] > lows[-2][1]
+        if not (hh and hl):
+            return False, f"bukan HH+HL (HH={hh}, HL={hl})"
+        after = closes.iloc[lows[-1][0] + 1:]
+        if len(after) and float(after.min()) < lows[-1][1]:
+            return False, "CHoCH: close di bawah HL terakhir"
+        return True, "HH+HL terjaga"
+    lh = highs[-1][1] < highs[-2][1]
+    ll = lows[-1][1] < lows[-2][1]
+    if not (lh and ll):
+        return False, f"bukan LH+LL (LH={lh}, LL={ll})"
+    after = closes.iloc[highs[-1][0] + 1:]
+    if len(after) and float(after.max()) > highs[-1][1]:
+        return False, "CHoCH: close di atas LH terakhir"
+    return True, "LH+LL terjaga"
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -15799,7 +15849,7 @@ def cmd_backtest(parts):
             _tok = parts[4].strip().lower()
             # Token ke-5 boleh langsung opsi (sr1.2 / pb / dl5 / dw5 / mt3) tanpa
             # harus isi mode strategi — mode default (SMC bot) dipakai.
-            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk)\d+(?:\.\d+)?", _tok):
+            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb)\d+(?:\.\d+)?", _tok):
                 parts = list(parts[:4]) + ["-"] + list(parts[4:])
                 _tok = "-"
             _m = _re.fullmatch(r"(rand|randsmc)(\d*)", _tok)
@@ -15870,10 +15920,10 @@ def cmd_backtest(parts):
                     extra_args += ["--ema-pullback", "gate"]
                     mode_label += " pb"
                     continue
-                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk)(\d+(?:\.\d+)?)", _x.strip().lower())
+                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb)(\d+(?:\.\d+)?)", _x.strip().lower())
                 if not _lm:
                     raise ValueError("limit")
-                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk"}[_lm.group(1)]
+                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer"}[_lm.group(1)]
                 _val = _lm.group(2)
                 if _lm.group(1) == "mt":
                     _val = str(int(float(_val)))
@@ -16929,7 +16979,7 @@ def get_daily_h4_bias(pair: str) -> tuple:
 #   {"EDGE_MAX_ATR_PCT": 0}                      → matikan batas ATR
 # ══════════════════════════════════════════════════════════════════════════
 EDGE_FILTER_ON    = True
-EDGE_ALLOWED_DIRS = {"SHORT"}   # {"LONG", "SHORT"} = dua arah
+EDGE_ALLOWED_DIRS = {"LONG", "SHORT"}   # v-struct: dua arah (gate lain simetris); {"SHORT"} = hanya short
 EDGE_MAX_ATR_PCT  = 0.6         # ATR% di TF entry; 0 = tanpa batas
 EDGE_PAIR_BLOCK   = set()       # opsional, mis. {"AVAXUSDT", "LINKUSDT", "DOGEUSDT"}
 
@@ -17457,6 +17507,13 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     effective_score = score
     if tier == "RELAXED" and trade_direction == "BEARISH":
         effective_score = score - SHORT_SCORE_PENALTY_RELAXED
+
+    if STRUCT_FILTER_LTF:
+        _sf_ok, _sf_why = _ltf_structure_ok(df_entry, trade_direction)
+        if not _sf_ok:
+            _dir_sf = "LONG" if trade_direction == "BULLISH" else "SHORT"
+            print(f"  ⛔ [{label}] {pair} {_dir_sf} — STRUCTURE FILTER: {_sf_why}, skip")
+            return
 
     if BOS_NONE_HARD_GATE and not bos_confirmed:
         _dir_b = "LONG" if trade_direction == "BULLISH" else "SHORT"
