@@ -5764,7 +5764,7 @@ TREND_GATE_ON         = True
 # True  = langsung skip (hemat juga 1 panggilan API). False = perilaku lama (adaptive).
 # Dasar: backtest 13 Sep–8 Okt 2026, 3 trade RANGING → 1 menang, total -20 USDT (sampel kecil).
 BLOCK_HTF_RANGING     = True
-TREND_GATE_ADX_MIN    = 20.0
+TREND_GATE_ADX_MIN    = 0.0  
 TREND_GATE_DI_ALIGN   = True
 
 # ── EDGE FILTER (2026-11-11, v70) ───────────────────────────────────────────
@@ -5782,7 +5782,7 @@ TREND_GATE_DI_ALIGN   = True
 # live. Matikan lewat BOT_OVERRIDES di backtest.py untuk A/B test:
 #   TREND_GATE_ADX_MAX = 0            → cap ADX nonaktif
 #   ENTRY_BLOCK_FVG_ONLY = False      → entry FVG-saja boleh lagi
-TREND_GATE_ADX_MAX    = 32.0   # skip kalau ADX(HTF) > nilai ini (0 = nonaktif)
+TREND_GATE_ADX_MAX    = 0.0    # skip kalau ADX(HTF) > nilai ini (0 = nonaktif)
 ENTRY_BLOCK_FVG_ONLY  = True   # skip kalau harga di FVG tapi TIDAK di OB
 
 # ── LOSS-DRIVER FILTERS (2026-11-17) — dari analisa 2 backtest log (n=17, SHORT semua) ──
@@ -5797,6 +5797,15 @@ TREND_GATE_DI_MIN     = 0.0    # skip kalau kekuatan DI gap HTF (searah trade) <
 # htf_struct_ok, htf_er, sl_source=OB/FVG/SWING) untuk dinilai belakangan. Yang TETAP aktif: skor minimum,
 # BOS NONE, volatilitas minimum, cooldown sinyal per pair, posisi aktif per pair.
 RESEARCH_MODE         = True
+# ── MODE LEAN (2026-11-17) — aturan sederhana hasil analisa 4 periode riset (772 trade) ─────────
+# Di atas RESEARCH_MODE (semua gate lama mati), LEAN_MODE menyalakan lagi HANYA 3 aturan, simetris
+# untuk LONG dan SHORT (jadi di bull market otomatis kebalik):
+#   1) slow trend searah  : SHORT hanya kalau EMA50 HTF <= EMA200 HTF, LONG kebalikannya
+#   2) DI searah          : -DI > +DI untuk SHORT, +DI > -DI untuk LONG
+#   3) entry wajib di zona OB/FVG (tanpa zona = skip)
+# Gate ADX/ATR/RANGING/struktur/FVG-saja SENGAJA mati (tidak terbukti membantu di data riset).
+# LONG ikut boleh (EDGE_ALLOWED_DIRS di-bypass) tapi di 4 periode tahun 2026 (bear) belum terbukti.
+LEAN_MODE             = True
 SHORT_RSI_MAX_ENTRY   = 0.0    # skip SHORT kalau RSI entry >= nilai ini (pullback, bukan lanjut turun; 0 = nonaktif)
 
 # ── PULLBACK EMA 20/50 (2026-11-15) — entry hanya saat harga kembali ke area EMA searah tren ──
@@ -16964,7 +16973,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     except Exception:
         adx_htf, pdi_htf, ndi_htf = 25.0, 0.0, 0.0
     di_gap_htf = (pdi_htf - ndi_htf) if trade_direction == "BULLISH" else (ndi_htf - pdi_htf)
-    if TREND_GATE_ON and not RESEARCH_MODE:
+    if TREND_GATE_ON and (not RESEARCH_MODE or LEAN_MODE):
         _dir_s = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if TREND_GATE_ADX_MIN > 0 and adx_htf < TREND_GATE_ADX_MIN:
             print(f"  ⛔ [{label}] {pair} {_dir_s} — TREND GATE: ADX {htf_tf} {adx_htf:.1f} "
@@ -16997,7 +17006,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 _slow_ok_data = True
     except Exception:
         ema_gap_htf, _slow_ok_data = 0.0, False
-    if SLOW_TREND_GATE_ON and not RESEARCH_MODE and _slow_ok_data and ema_gap_htf < 0:
+    if SLOW_TREND_GATE_ON and (not RESEARCH_MODE or LEAN_MODE) and _slow_ok_data and ema_gap_htf < 0:
         _dir_s2 = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_s2} — SLOW TREND GATE: EMA50 vs EMA200 {htf_tf} "
               f"berlawanan arah trade (gap {ema_gap_htf:+.2f}%), skip")
@@ -17180,7 +17189,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         print(f"  ⛔ [{label}] {pair} {_dir_s3} — EDGE FILTER: entry zona FVG-saja (tanpa OB), skip")
         return
 
-    if ENTRY_REQUIRE_ZONE and not RESEARCH_MODE and not in_ob and not in_fvg:
+    if ENTRY_REQUIRE_ZONE and (not RESEARCH_MODE or LEAN_MODE) and not in_ob and not in_fvg:
         _dir_z = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_z} — ENTRY ZONE GATE: harga tidak di OB/FVG (entry market), skip")
         return
