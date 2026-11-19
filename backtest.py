@@ -410,6 +410,8 @@ class Sim:
         self.rows = []
         self.day_pnl = Counter()      # tanggal UTC -> PnL terealisasi hari itu
         self.day_opened = Counter()   # tanggal UTC -> jumlah order yang dibuka hari itu
+        self.week_pnl = Counter()     # (tahun ISO, minggu) -> PnL terealisasi
+        self.month_pnl = Counter()    # (tahun, bulan) -> PnL terealisasi
         self.errs = Counter()
         self.fee = args.fee / 100.0
         self.risk_usdt = args.balance * args.risk / 100.0
@@ -470,7 +472,7 @@ def install_patches():
 # ═════════════════════════════════════════════════════════════════════════════
 def _csv_fields():
     base = list(bot._TRADE_LOG_CSV_FIELDS)          # sudah termasuk kolom versi bot
-    extra = ["bt_run_id", "bt_signal_ts", "bt_fill_ts", "adx_htf", "di_gap_htf", "ema_gap_htf", "htf_struct_ok", "htf_er"]
+    extra = ["bt_run_id", "bt_signal_ts", "bt_fill_ts", "adx_htf", "di_gap_htf", "ema_gap_htf"]
     return base + [c for c in extra if c not in base]
 
 
@@ -517,11 +519,13 @@ def _finish(pos, close_dt, close_price, close_type):
         "bt_signal_ts": pos["signal_dt"].isoformat(),
         "bt_fill_ts": pos["fill_dt"].isoformat(),
         "adx_htf": c.get("adx_htf", ""), "di_gap_htf": c.get("di_gap_htf", ""), "ema_gap_htf": c.get("ema_gap_htf", ""),
-        "htf_struct_ok": c.get("htf_struct_ok", ""), "htf_er": c.get("htf_er", ""),
     })
     row.update(bot._bot_version_fields())
     SIM.rows.append(row)
     SIM.day_pnl[close_dt.date()] += pnl
+    _cd = close_dt.date(); _iso = _cd.isocalendar()
+    SIM.week_pnl[(_iso[0], _iso[1])] += pnl
+    SIM.month_pnl[(_cd.year, _cd.month)] += pnl
     SIM.writer.writerow(row)
     SIM.fh.flush()
     SIM.open.pop(pos["pair"], None)
@@ -749,6 +753,16 @@ def _day_ok():
     if a.daily_win_pct > 0 and SIM.day_pnl[d] >= base * a.daily_win_pct / 100.0:
         SIM.errs["limit harian: win tercapai (scan dilewati)"] += 1
         return False
+    _iso = d.isocalendar(); _wk = (_iso[0], _iso[1]); _mo = (d.year, d.month)
+    if getattr(a, "weekly_loss_pct", 0) > 0 and SIM.week_pnl[_wk] <= -base * a.weekly_loss_pct / 100.0:
+        SIM.errs["limit mingguan: loss tercapai (scan dilewati)"] += 1
+        return False
+    if getattr(a, "monthly_loss_pct", 0) > 0 and SIM.month_pnl[_mo] <= -base * a.monthly_loss_pct / 100.0:
+        SIM.errs["limit bulanan: loss tercapai (scan dilewati)"] += 1
+        return False
+    if getattr(a, "monthly_win_pct", 0) > 0 and SIM.month_pnl[_mo] >= base * a.monthly_win_pct / 100.0:
+        SIM.errs["limit bulanan: target profit tercapai (scan dilewati)"] += 1
+        return False
     if a.max_trades_day > 0 and SIM.day_opened[d] >= a.max_trades_day:
         SIM.errs["limit harian: max trade/hari (scan dilewati)"] += 1
         return False
@@ -945,6 +959,7 @@ def summarize(rows, args, pairs, steps, n_open_end, errs):
     L.append(f"Periode   : {args.start_str} → {args.end_str} ({args.days} hari)")
     L.append(f"Pair      : {len(pairs)} | Scan tiap {args.scan_every} menit | Max open {args.max_open}")
     L.append(f"Limit hari: loss {args.daily_loss_pct:g}% | win {args.daily_win_pct:g}% | max trade/hari {args.max_trades_day} (0 = off)")
+    L.append(f"Limit periode: mingguan loss {args.weekly_loss_pct:g}% | bulanan loss {args.monthly_loss_pct:g}% | bulanan target {args.monthly_win_pct:g}% (0 = off)")
     _cfg = f"arah={DIRECTION} | BE_awal={EXP_BE_AT_R}"
     _cfg += f" | gate={'ON' if bot.TREND_GATE_ON else 'OFF'} adx>={bot.TREND_GATE_ADX_MIN:g} di={bot.TREND_GATE_DI_ALIGN}"
     _cfg += f" | floor={bot.MIN_SCORE_RELAXED_CUSTOM} shortpen={bot.SHORT_SCORE_PENALTY_RELAXED}"
@@ -1075,6 +1090,12 @@ def main():
                     help="stop scan sisa hari UTC bila PnL harian <= -X%% modal awal (0 = off)")
     ap.add_argument("--daily-win-pct", type=float, default=0.0,
                     help="stop scan sisa hari UTC bila PnL harian >= +X%% modal awal (0 = off)")
+    ap.add_argument("--weekly-loss-pct", type=float, default=0.0,
+                    help="stop scan sisa minggu (ISO) bila PnL mingguan <= -X%% modal awal (0 = off)")
+    ap.add_argument("--monthly-loss-pct", type=float, default=0.0,
+                    help="stop scan sisa bulan bila PnL bulanan <= -X%% modal awal (0 = off)")
+    ap.add_argument("--monthly-win-pct", type=float, default=0.0,
+                    help="stop scan sisa bulan bila PnL bulanan >= +X%% modal awal (0 = off)")
     ap.add_argument("--max-trades-day", type=int, default=0,
                     help="maks order dibuka per hari UTC (0 = off)")
     ap.add_argument("--fee", type=float, default=FEE_PCT, help="fee %% per sisi")
@@ -1274,7 +1295,7 @@ SLIM_COLS = ["ts", "bt_signal_ts", "symbol", "direction", "entry", "close_price"
              "vol_rat", "htf_bias", "bos_strength", "engulf_break", "engulf_entry", "engulf_note",
              "fvg_retest", "fvg_retest_note", "stoch_div", "stoch_weak", "stoch_note", "sweep_strength", "sl_source", "rsi_entry",
              "mae_pct", "mfe_pct", "duration_sec", "btc_bias", "btcd_trend", "btc_ltf_dir", "mkt_regime", "alt_bull_pct", "alt_bear_pct",
-             "adx_htf", "di_gap_htf", "ema_gap_htf", "htf_struct_ok", "htf_er"]
+             "adx_htf", "di_gap_htf", "ema_gap_htf"]
 TRADES_MARKER = "### TRADES_CSV"
 
 
