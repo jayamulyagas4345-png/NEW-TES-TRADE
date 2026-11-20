@@ -5849,6 +5849,14 @@ ENTRY_BLOCK_FVG_ONLY  = True   # skip kalau harga di FVG tapi TIDAK di OB
 # SAMPEL KECIL & belum tervalidasi — A/B dulu lewat BOT_OVERRIDES di backtest.py (100+ trade)
 # sebelum live. Matikan: TREND_GATE_DI_MIN = 0 / SHORT_RSI_MAX_ENTRY = 0.
 TREND_GATE_DI_MIN     = 0.0    # skip kalau kekuatan DI gap HTF (searah trade) < nilai ini (0 = nonaktif)
+# ── MODE RISET (2026-11-17) — HANYA UNTUK BACKTEST, JANGAN DIPAKAI LIVE ──────────────────────
+# True = gate pemfilter lama dimatikan: RANGING block + LTF-score gate, trend gate ADX/DI, slow trend,
+# HTF structure, edge filter (arah/ATR/pair), FVG-only, entry-zone, dan tolak LONG di sesi Asia.
+# TETAP aktif: skor minimum, BOS NONE, volatilitas minimum, cooldown sinyal per pair, posisi aktif per pair,
+# serta STRUCT_FILTER_LTF (kalau dinyalakan lewat token `sf1`) dan limit harian/mingguan/bulanan (kalau diberi token).
+# Nilai input tiap gate dicatat ke CSV (adx_htf, di_gap_htf, ema_gap_htf, atr_pct, htf_bias,
+# htf_struct_ok, htf_er, sl_source=OB/FVG/SWING) untuk dinilai belakangan.
+RESEARCH_MODE         = True
 SHORT_RSI_MAX_ENTRY   = 0.0    # skip SHORT kalau RSI entry >= nilai ini (pullback, bukan lanjut turun; 0 = nonaktif)
 
 # ── PULLBACK EMA 20/50 (2026-11-15) — entry hanya saat harga kembali ke area EMA searah tren ──
@@ -17038,7 +17046,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     htf_bias, htf_event, _, _ = detect_structure(df_htf)
     ranging_ctx = None
 
-    if BLOCK_HTF_RANGING and htf_bias == "RANGING":
+    if BLOCK_HTF_RANGING and not RESEARCH_MODE and htf_bias == "RANGING":
         print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} RANGING (sideways), BLOCK_HTF_RANGING aktif, skip")
         return
 
@@ -17060,7 +17068,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
         ranging_ctx = evaluate_htf_ranging(df_htf, df_entry_pre, htf_event, pair, label)
 
-        if not ranging_ctx.allowed:
+        if not ranging_ctx.allowed and not (RESEARCH_MODE and getattr(ranging_ctx, "direction", None)):
             print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} RANGING, LTF score {ranging_ctx.ltf_score} "
                   f"< gate {LTF_RANGING_SCORE_GATE} (tidak ada bias jelas), skip")
             return
@@ -17100,7 +17108,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     except Exception:
         adx_htf, pdi_htf, ndi_htf = 25.0, 0.0, 0.0
     di_gap_htf = (pdi_htf - ndi_htf) if trade_direction == "BULLISH" else (ndi_htf - pdi_htf)
-    if TREND_GATE_ON:
+    if TREND_GATE_ON and not RESEARCH_MODE:
         _dir_s = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if TREND_GATE_ADX_MIN > 0 and adx_htf < TREND_GATE_ADX_MIN:
             print(f"  ⛔ [{label}] {pair} {_dir_s} — TREND GATE: ADX {htf_tf} {adx_htf:.1f} "
@@ -17133,20 +17141,23 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 _slow_ok_data = True
     except Exception:
         ema_gap_htf, _slow_ok_data = 0.0, False
-    if SLOW_TREND_GATE_ON and _slow_ok_data and ema_gap_htf < 0:
+    if SLOW_TREND_GATE_ON and not RESEARCH_MODE and _slow_ok_data and ema_gap_htf < 0:
         _dir_s2 = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_s2} — SLOW TREND GATE: EMA50 vs EMA200 {htf_tf} "
               f"berlawanan arah trade (gap {ema_gap_htf:+.2f}%), skip")
         return
 
     # ── HTF STRUCTURE GATE (v76) — alt harus breakout/breakdown atau struktur jelas ──
-    if HTF_STRUCT_GATE_ON:
+    _hs_ok, _hs_er = "", ""
+    if HTF_STRUCT_GATE_ON or RESEARCH_MODE:
         try:
             _atr_h = calculate_atr(df_htf)
         except Exception:
             _atr_h = None
         _st_ok, _st_why, _st_info = check_htf_structure(df_htf, trade_direction, _atr_h)
-        if not _st_ok:
+        _hs_ok = int(bool(_st_ok))
+        _hs_er = round(float(_st_info["er"]), 3) if _st_info.get("er") is not None else ""
+        if not _st_ok and not RESEARCH_MODE:
             _dir_s3 = "LONG" if trade_direction == "BULLISH" else "SHORT"
             print(f"  ⛔ [{label}] {pair} {_dir_s3} — HTF STRUCTURE GATE: {_st_why}, skip")
             return
@@ -17182,7 +17193,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     entry_atr_pct = (entry_atr / current_price * 100) if current_price > 0 else 0.0
 
     # ── EDGE FILTER (v77) — arah, volatilitas, pair ──
-    if EDGE_FILTER_ON:
+    if EDGE_FILTER_ON and not RESEARCH_MODE:
         _edge_dir = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if _edge_dir not in EDGE_ALLOWED_DIRS:
             print(f"  ⛔ [{label}] {pair} {_edge_dir} — EDGE FILTER: arah dimatikan, skip")
@@ -17308,12 +17319,12 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     in_fvg       = price_in_fvg(price, fvg)
 
     # EDGE FILTER v70: entry di FVG-saja (tanpa OB) terbukti negatif di backtest.
-    if ENTRY_BLOCK_FVG_ONLY and in_fvg and not in_ob:
+    if ENTRY_BLOCK_FVG_ONLY and not RESEARCH_MODE and in_fvg and not in_ob:
         _dir_s3 = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_s3} — EDGE FILTER: entry zona FVG-saja (tanpa OB), skip")
         return
 
-    if ENTRY_REQUIRE_ZONE and not in_ob and not in_fvg:
+    if ENTRY_REQUIRE_ZONE and not RESEARCH_MODE and not in_ob and not in_fvg:
         _dir_z = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_z} — ENTRY ZONE GATE: harga tidak di OB/FVG (entry market), skip")
         return
@@ -17494,7 +17505,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     # FIX (2026-08-31, 1:1 PORT dari base): reject sinyal BULLISH saat sesi
     # Asia — backtest nemu kombinasi ini WR 21.3% (-14.85R, n=47), jauh di
     # bawah rata-rata.
-    if trade_direction == "BULLISH" and session == "Asia":
+    if trade_direction == "BULLISH" and session == "Asia" and not RESEARCH_MODE:
         print(f"  ⛔ [{label}] {pair} — BULLISH di sesi Asia (ditolak, historis WR 21.3%)")
         return
 
@@ -17714,6 +17725,8 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         "adx_htf":        round(adx_htf, 2),
         "di_gap_htf":     round(di_gap_htf, 2),
         "ema_gap_htf":    round(ema_gap_htf, 3),
+        "htf_struct_ok":  _hs_ok,
+        "htf_er":         _hs_er,
     })
 
     tier_label = f"{tier}{'(RANGING)' if ranging_ctx else ''}"
