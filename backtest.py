@@ -472,7 +472,7 @@ def install_patches():
 # ═════════════════════════════════════════════════════════════════════════════
 def _csv_fields():
     base = list(bot._TRADE_LOG_CSV_FIELDS)          # sudah termasuk kolom versi bot
-    extra = ["bt_run_id", "bt_signal_ts", "bt_fill_ts", "adx_htf", "di_gap_htf", "ema_gap_htf"]
+    extra = ["bt_run_id", "bt_signal_ts", "bt_fill_ts", "adx_htf", "di_gap_htf", "ema_gap_htf", "htf_struct_ok", "htf_er"]
     return base + [c for c in extra if c not in base]
 
 
@@ -519,6 +519,7 @@ def _finish(pos, close_dt, close_price, close_type):
         "bt_signal_ts": pos["signal_dt"].isoformat(),
         "bt_fill_ts": pos["fill_dt"].isoformat(),
         "adx_htf": c.get("adx_htf", ""), "di_gap_htf": c.get("di_gap_htf", ""), "ema_gap_htf": c.get("ema_gap_htf", ""),
+        "htf_struct_ok": c.get("htf_struct_ok", ""), "htf_er": c.get("htf_er", ""),
     })
     row.update(bot._bot_version_fields())
     SIM.rows.append(row)
@@ -1304,7 +1305,7 @@ SLIM_COLS = ["ts", "bt_signal_ts", "symbol", "direction", "entry", "close_price"
              "vol_rat", "htf_bias", "bos_strength", "engulf_break", "engulf_entry", "engulf_note",
              "fvg_retest", "fvg_retest_note", "stoch_div", "stoch_weak", "stoch_note", "sweep_strength", "sl_source", "rsi_entry",
              "mae_pct", "mfe_pct", "duration_sec", "btc_bias", "btcd_trend", "btc_ltf_dir", "mkt_regime", "alt_bull_pct", "alt_bear_pct",
-             "adx_htf", "di_gap_htf", "ema_gap_htf"]
+             "adx_htf", "di_gap_htf", "ema_gap_htf", "htf_struct_ok", "htf_er"]
 TRADES_MARKER = "### TRADES_CSV"
 
 
