@@ -971,7 +971,7 @@ def summarize(rows, args, pairs, steps, n_open_end, errs):
     if EXP_SINGLE_TP:
         _cfg += f" | SINGLE_TP={bot.RR_GRADE_B:g}R (tanpa partial)"
     _cfg += f" | adx_max={getattr(bot, 'TREND_GATE_ADX_MAX', 0):g} fvg_only_block={'ON' if getattr(bot, 'ENTRY_BLOCK_FVG_ONLY', False) else 'OFF'}"
-    _cfg += f" | struct_filter={'ON' if getattr(bot, 'STRUCT_FILTER_LTF', False) else 'OFF'} sl_buffer={getattr(bot, 'SL_BUFFER_ATR_MULT', 0):g}xATR dirs={'+'.join(sorted(getattr(bot, 'EDGE_ALLOWED_DIRS', [])))}"
+    _cfg += f" | research={'ON' if getattr(bot, 'RESEARCH_MODE', False) else 'OFF'} retest_zone={getattr(bot, 'HTF_RETEST_ZONE_MODE', 0)} struct_filter={'ON' if getattr(bot, 'STRUCT_FILTER_LTF', False) else 'OFF'} sl_buffer={getattr(bot, 'SL_BUFFER_ATR_MULT', 0):g}xATR dirs={'+'.join(sorted(getattr(bot, 'EDGE_ALLOWED_DIRS', [])))}"
     L.append(f"Config    : {_cfg}")
     if getattr(args, "random_entry", False):
         L.append(f"MODE      : *** BASELINE ACAK *** seed={args.seed} prob={args.rand_prob:g} "
@@ -1096,6 +1096,10 @@ def main():
                     help="1 = nyalakan main.STRUCT_FILTER_LTF (HH+HL / LH+LL, belum CHoCH di entry TF). 0 = ikut file")
     ap.add_argument("--sl-buffer", type=float, default=0.0,
                     help="override main.SL_BUFFER_ATR_MULT (buffer SL di luar zona, x ATR; mis. 0.3). 0 = ikut file")
+    ap.add_argument("--retest-zone", type=int, default=0,
+                    help="main.HTF_RETEST_ZONE_MODE: 0 = ikut file | 1 = hanya zona retest HTF | 2 = OB/FVG 30m atau zona retest HTF")
+    ap.add_argument("--research", type=int, default=-1,
+                    help="-1 = ikut file | 0 = gate lama aktif | 1 = MODE RISET (gate lama mati, hanya untuk backtest)")
     ap.add_argument("--weekly-loss-pct", type=float, default=0.0,
                     help="stop scan sisa minggu (ISO) bila PnL mingguan <= -X%% modal awal (0 = off)")
     ap.add_argument("--monthly-loss-pct", type=float, default=0.0,
@@ -1137,6 +1141,10 @@ def main():
     global FLIP, EXP_BE_AT_R
     if args.struct_filter:
         bot.STRUCT_FILTER_LTF = True
+    if args.retest_zone:
+        bot.HTF_RETEST_ZONE_MODE = int(args.retest_zone)
+    if args.research >= 0:
+        bot.RESEARCH_MODE = bool(args.research)
     if args.sl_buffer and args.sl_buffer > 0:
         bot.SL_BUFFER_ATR_MULT = float(args.sl_buffer)
     if args.be_at_r and args.be_at_r > 0:
