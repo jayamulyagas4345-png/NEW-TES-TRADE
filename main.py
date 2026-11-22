@@ -3331,6 +3331,116 @@ def find_swings(df: pd.DataFrame, window: int = SWING_WINDOW) -> tuple:
     return highs, lows
 
 
+def _lux_order_blocks(df: pd.DataFrame, size: int = 5, swing_size: int = 50, atr_len: int = 200) -> list:
+    """
+    Order block internal gaya LuxAlgo "Smart Money Concepts" (OB belum termitigasi di bar terakhir).
+    Return list of dict(top, bot, bias[+1/-1], idx) urut dari yang terbaru.
+    Logika: leg/pivot (size 5), struktur jebol = close cross pivot terakhir; OB = candle paling ekstrem
+    (parsed low terendah utk bullish / parsed high tertinggi utk bearish) dari bar pivot sampai bar sebelum jebol;
+    mitigasi: bearish dihapus kalau high > OB high, bullish dihapus kalau low < OB low.
+    Catatan: filter high-volatility bar (range >= 2 x ATR200) ikut ditiru; kondisi 'internal != swing pivot' ikut.
+    """
+    import numpy as np
+    n = len(df)
+    if n < size + 5:
+        return []
+    H = df["high"].astype(float).values
+    L = df["low"].astype(float).values
+    C = df["close"].astype(float).values
+    prev_c = np.r_[C[0], C[:-1]]
+    tr = np.maximum(H - L, np.maximum(np.abs(H - prev_c), np.abs(L - prev_c)))
+    atr = np.full(n, np.nan)
+    if n >= atr_len:
+        atr[atr_len - 1] = tr[:atr_len].mean()
+        for k in range(atr_len, n):
+            atr[k] = (atr[k - 1] * (atr_len - 1) + tr[k]) / atr_len
+    hv = np.where(np.isnan(atr), False, (H - L) >= 2 * np.nan_to_num(atr, nan=1e18))
+    PH = np.where(hv, L, H)
+    PL = np.where(hv, H, L)
+
+    def pivots(sz):
+        """per bar t: (event, level, idx) event: +1 pivot low baru, -1 pivot high baru, 0 tidak ada."""
+        ev = [(0, None, None)] * n
+        leg = 0
+        for t in range(sz, n):
+            hi_ = H[t - sz] > H[t - sz + 1:t + 1].max() if sz > 0 else False
+            lo_ = L[t - sz] < L[t - sz + 1:t + 1].min() if sz > 0 else False
+            new = leg
+            if hi_:
+                new = 0
+            elif lo_:
+                new = 1
+            if new != leg:
+                ev[t] = (1, L[t - sz], t - sz) if new == 1 else (-1, H[t - sz], t - sz)
+            leg = new
+        return ev
+
+    ev_i = pivots(size)
+    ev_s = pivots(swing_size)
+    ih = il = sh = sl_ = None            # level
+    ih_cr = il_cr = False
+    ih_idx = il_idx = None
+    prev_ih = prev_il = None
+    obs = []
+    for t in range(n):
+        e, lvl, idx = ev_s[t]
+        if e == -1:
+            sh = lvl
+        elif e == 1:
+            sl_ = lvl
+        e, lvl, idx = ev_i[t]
+        if e == -1:
+            ih, ih_cr, ih_idx = lvl, False, idx
+        elif e == 1:
+            il, il_cr, il_idx = lvl, False, idx
+        if t > 0:
+            if ih is not None and prev_ih is not None and C[t] > ih and C[t - 1] <= prev_ih and not ih_cr and ih != sh:
+                ih_cr = True
+                seg = PL[ih_idx:t]
+                if len(seg):
+                    j = ih_idx + int(np.argmin(seg))
+                    obs.insert(0, {"top": PH[j], "bot": PL[j], "bias": 1, "idx": j})
+            if il is not None and prev_il is not None and C[t] < il and C[t - 1] >= prev_il and not il_cr and il != sl_:
+                il_cr = True
+                seg = PH[il_idx:t]
+                if len(seg):
+                    j = il_idx + int(np.argmax(seg))
+                    obs.insert(0, {"top": PH[j], "bot": PL[j], "bias": -1, "idx": j})
+        # mitigasi
+        obs = [o for o in obs if not ((o["bias"] == -1 and H[t] > max(o["top"], o["bot"])) or (o["bias"] == 1 and L[t] < min(o["top"], o["bot"])))]
+        if len(obs) > 100:
+            obs = obs[:100]
+        prev_ih, prev_il = ih, il
+    return obs
+
+
+def _lux_retest_zone(df: pd.DataFrame, direction: str, price: float):
+    """OB gaya LuxAlgo di sisi retest: BEARISH → supply di atas harga, BULLISH → demand di bawah harga.
+    RZ_OB_PICK=0: terdekat; =1: OB asal impuls (pergerakan lanjutan terbesar setelah OB)."""
+    obs = _lux_order_blocks(df, RZ_OB_SIZE)
+    Hh = df["high"].astype(float).values
+    Ll = df["low"].astype(float).values
+    cands = []
+    for o in obs:
+        lo_, hi_ = min(o["top"], o["bot"]), max(o["top"], o["bot"])
+        if direction == "BEARISH" and o["bias"] == -1 and hi_ >= price:
+            d = max(0.0, lo_ - price)
+            disp = hi_ - float(Ll[o["idx"] + 1:].min()) if o["idx"] + 1 < len(Ll) else 0.0
+        elif direction == "BULLISH" and o["bias"] == 1 and lo_ <= price:
+            d = max(0.0, price - hi_)
+            disp = float(Hh[o["idx"] + 1:].max()) - lo_ if o["idx"] + 1 < len(Hh) else 0.0
+        else:
+            continue
+        cands.append((d, disp, lo_, hi_))
+    if not cands:
+        return None
+    if RZ_OB_PICK == 1:
+        best = max(cands, key=lambda c: c[1])
+    else:
+        best = min(cands, key=lambda c: c[0])
+    return best[2], best[3]
+
+
 def _htf_retest_zone(df_htf: pd.DataFrame, direction: str):
     """
     Zona retest HTF → (lo, hi) atau None.
@@ -5941,6 +6051,12 @@ HTF_RETEST_ZONE_MODE  = 0
 RZ_UP_ATR             = 0.5
 RZ_BACK_ATR           = 0.25
 RZ_SL_BUF_ATR         = 0.3
+# Sumber zona: 0 = band di sekitar level swing 1h yang jebol (v1) | 1 = OB gaya LuxAlgo di 1h (HTF) |
+#              2 = OB gaya LuxAlgo di entry TF (30m). Di backtest: token `zs0` / `zs1` / `zs2`.
+HTF_RETEST_ZONE_SRC   = 1
+RZ_OB_SIZE            = 5       # size struktur internal LuxAlgo
+# Pilih OB: 0 = terdekat dari harga | 1 = 'origin' = OB dengan pergerakan lanjutan terbesar sesudahnya (asal impuls). Token `zp0`/`zp1`.
+RZ_OB_PICK            = 1
 SHORT_RSI_MAX_ENTRY   = 0.0    # skip SHORT kalau RSI entry >= nilai ini (pullback, bukan lanjut turun; 0 = nonaktif)
 
 # ── PULLBACK EMA 20/50 (2026-11-15) — entry hanya saat harga kembali ke area EMA searah tren ──
@@ -15941,7 +16057,7 @@ def cmd_backtest(parts):
             _tok = parts[4].strip().lower()
             # Token ke-5 boleh langsung opsi (sr1.2 / pb / dl5 / dw5 / mt3) tanpa
             # harus isi mode strategi — mode default (SMC bot) dipakai.
-            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs)\d+(?:\.\d+)?", _tok):
+            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp)\d+(?:\.\d+)?", _tok):
                 parts = list(parts[:4]) + ["-"] + list(parts[4:])
                 _tok = "-"
             _m = _re.fullmatch(r"(rand|randsmc)(\d*)", _tok)
@@ -16012,10 +16128,10 @@ def cmd_backtest(parts):
                     extra_args += ["--ema-pullback", "gate"]
                     mode_label += " pb"
                     continue
-                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs)(\d+(?:\.\d+)?)", _x.strip().lower())
+                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp)(\d+(?:\.\d+)?)", _x.strip().lower())
                 if not _lm:
                     raise ValueError("limit")
-                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research"}[_lm.group(1)]
+                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick"}[_lm.group(1)]
                 _val = _lm.group(2)
                 if _lm.group(1) == "mt":
                     _val = str(int(float(_val)))
@@ -17406,7 +17522,12 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     _rz_touch = False
     _rz_lo = _rz_hi = None
     if HTF_RETEST_ZONE_MODE:
-        _z = _htf_retest_zone(df_htf, trade_direction)
+        if HTF_RETEST_ZONE_SRC == 1:
+            _z = _lux_retest_zone(df_htf, trade_direction, price)
+        elif HTF_RETEST_ZONE_SRC == 2:
+            _z = _lux_retest_zone(df_entry, trade_direction, price)
+        else:
+            _z = _htf_retest_zone(df_htf, trade_direction)
         if _z is not None:
             _rz_lo, _rz_hi = _z
             _cl_ = df_entry.iloc[-1]
