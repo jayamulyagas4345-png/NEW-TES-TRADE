@@ -6054,6 +6054,12 @@ RZ_SL_BUF_ATR         = 0.3
 # Sumber zona: 0 = band di sekitar level swing 1h yang jebol (v1) | 1 = OB gaya LuxAlgo di 1h (HTF) |
 #              2 = OB gaya LuxAlgo di entry TF (30m). Di backtest: token `zs0` / `zs1` / `zs2`.
 HTF_RETEST_ZONE_SRC   = 1
+
+# ── REGIME WAJIB SEARAH (v-regime 2026-11-17) ────────────────────────────────────────────────
+# Dari analisa 1309 trade (6 window): trade searah regime pasar (LONG di BULL_REGIME, SHORT di BEAR_REGIME) R +0.27,
+# MIXED +0.02. True = hanya entry kalau regime searah (BTC/ETH dikecualikan). Beda dengan EDGE_REGIME_GATE_ON
+# yang cuma memblok yang MELAWAN regime (hampir tak pernah terjadi). Di backtest: token `rg1`. Default MATI.
+REGIME_REQUIRE_ALIGNED = False
 RZ_OB_SIZE            = 5       # size struktur internal LuxAlgo
 # Pilih OB: 0 = terdekat dari harga | 1 = 'origin' = OB dengan pergerakan lanjutan terbesar sesudahnya (asal impuls). Token `zp0`/`zp1`.
 RZ_OB_PICK            = 1
@@ -16057,7 +16063,7 @@ def cmd_backtest(parts):
             _tok = parts[4].strip().lower()
             # Token ke-5 boleh langsung opsi (sr1.2 / pb / dl5 / dw5 / mt3) tanpa
             # harus isi mode strategi — mode default (SMC bot) dipakai.
-            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp)\d+(?:\.\d+)?", _tok):
+            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg)\d+(?:\.\d+)?", _tok):
                 parts = list(parts[:4]) + ["-"] + list(parts[4:])
                 _tok = "-"
             _m = _re.fullmatch(r"(rand|randsmc)(\d*)", _tok)
@@ -16128,10 +16134,10 @@ def cmd_backtest(parts):
                     extra_args += ["--ema-pullback", "gate"]
                     mode_label += " pb"
                     continue
-                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp)(\d+(?:\.\d+)?)", _x.strip().lower())
+                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg)(\d+(?:\.\d+)?)", _x.strip().lower())
                 if not _lm:
                     raise ValueError("limit")
-                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick"}[_lm.group(1)]
+                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick", "rg": "--regime-aligned"}[_lm.group(1)]
                 _val = _lm.group(2)
                 if _lm.group(1) == "mt":
                     _val = str(int(float(_val)))
@@ -17430,7 +17436,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
     # ── MARKET REGIME (v78) — catat ke log, gate opsional ──
     _mkt_regime, _alt_bull, _alt_bear = "?", -1.0, -1.0
-    if EDGE_REGIME_LOG_ON or EDGE_REGIME_GATE_ON:
+    if EDGE_REGIME_LOG_ON or EDGE_REGIME_GATE_ON or REGIME_REQUIRE_ALIGNED:
         try:
             _reg = get_market_regime_signalonly(btc_bias)
             _mkt_regime = _reg.get("regime", "MIXED")
@@ -17441,8 +17447,17 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 if _reg_blk:
                     print(f"  ⛔ [{label}] {pair} — EDGE FILTER: {_reg_why}, skip")
                     return
+            if REGIME_REQUIRE_ALIGNED and pair not in ALTCOIN_EXEMPTIONS:
+                _need_reg = "BULL_REGIME" if trade_direction == "BULLISH" else "BEAR_REGIME"
+                if _mkt_regime != _need_reg:
+                    _dir_rg = "LONG" if trade_direction == "BULLISH" else "SHORT"
+                    print(f"  ⛔ [{label}] {pair} {_dir_rg} — REGIME ALIGN: regime {_mkt_regime}, butuh {_need_reg}, skip")
+                    return
         except Exception as _reg_err:
             print(f"  ⚠️ [{label}] {pair} — cek market regime gagal ({_reg_err}), dilewati")
+            if REGIME_REQUIRE_ALIGNED and pair not in ALTCOIN_EXEMPTIONS:
+                print(f"  ⛔ [{label}] {pair} — REGIME ALIGN: regime tidak diketahui, skip")
+                return
 
     if has_active_position(pair, trade_direction):
         dir_str = "LONG" if trade_direction == "BULLISH" else "SHORT"
