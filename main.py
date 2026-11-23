@@ -3441,6 +3441,52 @@ def _lux_retest_zone(df: pd.DataFrame, direction: str, price: float):
     return best[2], best[3]
 
 
+def _htf_demand_long_check(pair: str, entry_tf: str):
+    """
+    Cek setup LONG di demand TF tinggi. Return (zone_lo, zone_hi, wick_low) atau None.
+    Zona = OB bullish gaya LuxAlgo (belum termitigasi) di 1D (mode 1) / 1W (mode 2) yang disentuh dalam
+    DZ_TOUCH_BARS candle entry TF terakhir, dan harga sekarang masih di atas dasar zona.
+    """
+    try:
+        tf = "1w" if HTF_DEMAND_MODE == 2 else "1d"
+        df_z = fetch_ohlcv_safe(pair, tf, limit=300)
+        if df_z is None or len(df_z) < 40:
+            return None
+        df_e = fetch_ohlcv(pair, entry_tf, limit=250)
+        if df_e is None or len(df_e) < DZ_TOUCH_BARS + 5:
+            return None
+        obs = [o for o in _lux_order_blocks(df_z, RZ_OB_SIZE) if o["bias"] == 1]
+        if not obs:
+            return None
+        recent = df_e.iloc[-DZ_TOUCH_BARS:]
+        lows = recent["low"].astype(float).values
+        highs = recent["high"].astype(float).values
+        last_close = float(df_e["close"].iloc[-1])
+        for o in obs:   # terbaru dulu
+            z_lo, z_hi = min(o["top"], o["bot"]), max(o["top"], o["bot"])
+            touched = bool(((lows <= z_hi) & (highs >= z_lo)).any())
+            if touched and last_close > z_lo:
+                return float(z_lo), float(z_hi), float(lows.min())
+        return None
+    except Exception:
+        return None
+
+
+def _dz_entry_sl_tp(price: float, z_lo: float, wick_low: float, atr: float) -> tuple:
+    """Entry LONG di harga sekarang, SL di bawah dasar zona / wick sentuhan terendah + buffer."""
+    entry = price
+    sl = min(z_lo, wick_low) - RZ_SL_BUF_ATR * (atr or 0.0)
+    dist = entry - sl
+    tp1 = entry + dist * TP1_R_MULT
+    tp2 = entry + dist * (RR_GRADE_A + 0.5)
+    if dist <= 0:
+        return entry, sl, tp1, tp2, 0.0, 0.0
+    if SINGLE_TP_MODE:
+        tp1 = entry + dist * SINGLE_TP_R_MULT
+        tp2 = tp1
+    return entry, sl, tp1, tp2, round(abs(tp1 - entry) / dist, 2), round(abs(tp2 - entry) / dist, 2)
+
+
 def _htf_retest_zone(df_htf: pd.DataFrame, direction: str):
     """
     Zona retest HTF → (lo, hi) atau None.
@@ -6060,6 +6106,15 @@ HTF_RETEST_ZONE_SRC   = 1
 # MIXED +0.02. True = hanya entry kalau regime searah (BTC/ETH dikecualikan). Beda dengan EDGE_REGIME_GATE_ON
 # yang cuma memblok yang MELAWAN regime (hampir tak pernah terjadi). Di backtest: token `rg1`. Default MATI.
 REGIME_REQUIRE_ALIGNED = False
+
+# ── LONG DI DEMAND TIMEFRAME TINGGI + REAKSI LTF (v-dz 2026-11-17) ───────────────────────────
+# Ide: LONG hanya saat harga baru menyentuh zona DEMAND (OB bullish gaya LuxAlgo, belum termitigasi) di 1D / 1W,
+# lalu menunggu REAKSI di entry TF (BOS bullish = HH+HL di 30m, harga masih di atas dasar zona).
+# SL di bawah dasar zona / wick terendah sentuhan (+ buffer RZ_SL_BUF_ATR x ATR), TP = SINGLE_TP_R_MULT.
+# Jalur ini MENGGANTIKAN gate arah HTF (ranging, ADX/DI, slow trend, struktur HTF, regime) karena ini setup reversal.
+# 0 = mati | 1 = demand 1D | 2 = demand 1W. Di backtest: token `dz1` / `dz2`. Default MATI.
+HTF_DEMAND_MODE       = 0
+DZ_TOUCH_BARS         = 16      # sentuhan zona dihitung kalau terjadi dalam N candle entry TF terakhir (16 x 30m = 8 jam)
 RZ_OB_SIZE            = 5       # size struktur internal LuxAlgo
 # Pilih OB: 0 = terdekat dari harga | 1 = 'origin' = OB dengan pergerakan lanjutan terbesar sesudahnya (asal impuls). Token `zp0`/`zp1`.
 RZ_OB_PICK            = 1
@@ -16063,7 +16118,7 @@ def cmd_backtest(parts):
             _tok = parts[4].strip().lower()
             # Token ke-5 boleh langsung opsi (sr1.2 / pb / dl5 / dw5 / mt3) tanpa
             # harus isi mode strategi — mode default (SMC bot) dipakai.
-            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg)\d+(?:\.\d+)?", _tok):
+            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz)\d+(?:\.\d+)?", _tok):
                 parts = list(parts[:4]) + ["-"] + list(parts[4:])
                 _tok = "-"
             _m = _re.fullmatch(r"(rand|randsmc)(\d*)", _tok)
@@ -16134,10 +16189,10 @@ def cmd_backtest(parts):
                     extra_args += ["--ema-pullback", "gate"]
                     mode_label += " pb"
                     continue
-                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg)(\d+(?:\.\d+)?)", _x.strip().lower())
+                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz)(\d+(?:\.\d+)?)", _x.strip().lower())
                 if not _lm:
                     raise ValueError("limit")
-                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick", "rg": "--regime-aligned"}[_lm.group(1)]
+                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick", "rg": "--regime-aligned", "dz": "--demand-long"}[_lm.group(1)]
                 _val = _lm.group(2)
                 if _lm.group(1) == "mt":
                     _val = str(int(float(_val)))
@@ -17252,7 +17307,14 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     htf_bias, htf_event, _, _ = detect_structure(df_htf)
     ranging_ctx = None
 
-    if BLOCK_HTF_RANGING and not RESEARCH_MODE and htf_bias == "RANGING":
+    # LONG di demand TF tinggi (opsional) — setup reversal, menggantikan gate arah HTF
+    _dz_long, _dz_zone, _dz_wick = False, None, None
+    if HTF_DEMAND_MODE:
+        _dz_res = _htf_demand_long_check(pair, entry_tf)
+        if _dz_res is not None:
+            _dz_long, _dz_zone, _dz_wick = True, (_dz_res[0], _dz_res[1]), _dz_res[2]
+
+    if BLOCK_HTF_RANGING and not RESEARCH_MODE and htf_bias == "RANGING" and not _dz_long:
         print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} RANGING (sideways), BLOCK_HTF_RANGING aktif, skip")
         return
 
@@ -17274,7 +17336,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
         ranging_ctx = evaluate_htf_ranging(df_htf, df_entry_pre, htf_event, pair, label)
 
-        if not ranging_ctx.allowed and not (RESEARCH_MODE and getattr(ranging_ctx, "direction", None)):
+        if not ranging_ctx.allowed and not _dz_long and not (RESEARCH_MODE and getattr(ranging_ctx, "direction", None)):
             print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} RANGING, LTF score {ranging_ctx.ltf_score} "
                   f"< gate {LTF_RANGING_SCORE_GATE} (tidak ada bias jelas), skip")
             return
@@ -17287,7 +17349,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
     # RELAXED tier (LOW_TF): pakai logika asli, skip ranging tanpa CHoCH
     if tier == "RELAXED":
-        if htf_bias == "RANGING" and htf_event != "CHoCH":
+        if htf_bias == "RANGING" and htf_event != "CHoCH" and not _dz_long:
             print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} ranging tanpa CHoCH, skip")
             return
         if htf_bias == "RANGING":
@@ -17296,6 +17358,10 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
             htf_aligned     = False
         else:
             htf_aligned = True
+
+    if _dz_long:
+        trade_direction = "BULLISH"
+        htf_aligned     = False   # setup reversal: HTF 1h tidak dianggap searah
 
     # ── SIGNAL COOLDOWN CHECK ──────────────────────────────────────────────────
     # Blok sinyal arah yang sama selama SIGNAL_COOLDOWN_HOURS jam setelah sinyal terakhir.
@@ -17314,7 +17380,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     except Exception:
         adx_htf, pdi_htf, ndi_htf = 25.0, 0.0, 0.0
     di_gap_htf = (pdi_htf - ndi_htf) if trade_direction == "BULLISH" else (ndi_htf - pdi_htf)
-    if TREND_GATE_ON and not RESEARCH_MODE:
+    if TREND_GATE_ON and not RESEARCH_MODE and not _dz_long:
         _dir_s = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if TREND_GATE_ADX_MIN > 0 and adx_htf < TREND_GATE_ADX_MIN:
             print(f"  ⛔ [{label}] {pair} {_dir_s} — TREND GATE: ADX {htf_tf} {adx_htf:.1f} "
@@ -17347,7 +17413,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 _slow_ok_data = True
     except Exception:
         ema_gap_htf, _slow_ok_data = 0.0, False
-    if SLOW_TREND_GATE_ON and not RESEARCH_MODE and _slow_ok_data and ema_gap_htf < 0:
+    if SLOW_TREND_GATE_ON and not RESEARCH_MODE and not _dz_long and _slow_ok_data and ema_gap_htf < 0:
         _dir_s2 = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_s2} — SLOW TREND GATE: EMA50 vs EMA200 {htf_tf} "
               f"berlawanan arah trade (gap {ema_gap_htf:+.2f}%), skip")
@@ -17363,7 +17429,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         _st_ok, _st_why, _st_info = check_htf_structure(df_htf, trade_direction, _atr_h)
         _hs_ok = int(bool(_st_ok))
         _hs_er = round(float(_st_info["er"]), 3) if _st_info.get("er") is not None else ""
-        if not _st_ok and not RESEARCH_MODE:
+        if not _st_ok and not RESEARCH_MODE and not _dz_long:
             _dir_s3 = "LONG" if trade_direction == "BULLISH" else "SHORT"
             print(f"  ⛔ [{label}] {pair} {_dir_s3} — HTF STRUCTURE GATE: {_st_why}, skip")
             return
@@ -17399,7 +17465,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     entry_atr_pct = (entry_atr / current_price * 100) if current_price > 0 else 0.0
 
     # ── EDGE FILTER (v77) — arah, volatilitas, pair ──
-    if EDGE_FILTER_ON and not RESEARCH_MODE:
+    if EDGE_FILTER_ON and not RESEARCH_MODE and not _dz_long:
         _edge_dir = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if _edge_dir not in EDGE_ALLOWED_DIRS:
             print(f"  ⛔ [{label}] {pair} {_edge_dir} — EDGE FILTER: arah dimatikan, skip")
@@ -17447,7 +17513,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 if _reg_blk:
                     print(f"  ⛔ [{label}] {pair} — EDGE FILTER: {_reg_why}, skip")
                     return
-            if REGIME_REQUIRE_ALIGNED and pair not in ALTCOIN_EXEMPTIONS:
+            if REGIME_REQUIRE_ALIGNED and not _dz_long and pair not in ALTCOIN_EXEMPTIONS:
                 _need_reg = "BULL_REGIME" if trade_direction == "BULLISH" else "BEAR_REGIME"
                 if _mkt_regime != _need_reg:
                     _dir_rg = "LONG" if trade_direction == "BULLISH" else "SHORT"
@@ -17455,7 +17521,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                     return
         except Exception as _reg_err:
             print(f"  ⚠️ [{label}] {pair} — cek market regime gagal ({_reg_err}), dilewati")
-            if REGIME_REQUIRE_ALIGNED and pair not in ALTCOIN_EXEMPTIONS:
+            if REGIME_REQUIRE_ALIGNED and not _dz_long and pair not in ALTCOIN_EXEMPTIONS:
                 print(f"  ⛔ [{label}] {pair} — REGIME ALIGN: regime tidak diketahui, skip")
                 return
 
@@ -17553,6 +17619,10 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 _rz_touch = (_hh >= _rz_lo and _ll <= _rz_hi and _cc <= _rz_hi)
         if HTF_RETEST_ZONE_MODE == 1:
             in_ob, best_ob, in_fvg = False, None, False
+    if _dz_long:
+        _rz_touch = True
+        _rz_lo, _rz_hi = _dz_zone
+        in_ob, best_ob, in_fvg = False, None, False
 
     if HTF_RETEST_ZONE_MODE and not (in_ob or in_fvg or _rz_touch):
         _dir_rz = "LONG" if trade_direction == "BULLISH" else "SHORT"
@@ -17718,7 +17788,9 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         best_ob if in_ob else None,
         fvg     if in_fvg else None,
     )
-    if _rz_touch:
+    if _dz_long:
+        entry, sl, tp1, tp2, rr1, rr2 = _dz_entry_sl_tp(price, _rz_lo, _dz_wick, entry_atr)
+    elif _rz_touch:
         entry, sl, tp1, tp2, rr1, rr2 = _rz_entry_sl_tp(trade_direction, price, _rz_lo, _rz_hi, entry_atr)
 
     if MAX_ENTRY_DISTANCE_ENABLED and price > 0:
@@ -17769,7 +17841,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
             print(f"  ⛔ [{label}] {pair} {_dir_sf} — STRUCTURE FILTER: {_sf_why}, skip")
             return
 
-    if BOS_NONE_HARD_GATE and not bos_confirmed and not _rz_touch:
+    if BOS_NONE_HARD_GATE and not bos_confirmed and (not _rz_touch or _dz_long):
         _dir_b = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_b} — BOS NONE di {entry_tf} (hard gate, skip)")
         return
@@ -17881,7 +17953,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         "_stoch_weak":     stoch_weak_tag,
         "_stoch_note":     stoch_note,
         "_sweep_strength": sweep_strength or "NONE",
-        "_sl_source":      ("HTFZ" if _rz_touch else ("OB" if in_ob else ("FVG" if in_fvg else "SWING"))),
+        "_sl_source":      ("DEMAND" if _dz_long else ("HTFZ" if _rz_touch else ("OB" if in_ob else ("FVG" if in_fvg else "SWING")))),
         "_rsi_entry":      round(rsi, 2),
         "_btc_ltf_dir":    btc_ltf_dir,
         "_btcd_ltf_dir":   btcd_ltf_dir,
@@ -17959,7 +18031,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         "stoch_weak":     stoch_weak_tag,
         "stoch_note":     stoch_note,
         "sweep_strength": sweep_strength or "NONE",
-        "sl_source":      ("HTFZ" if _rz_touch else ("OB" if in_ob else ("FVG" if in_fvg else "SWING"))),
+        "sl_source":      ("DEMAND" if _dz_long else ("HTFZ" if _rz_touch else ("OB" if in_ob else ("FVG" if in_fvg else "SWING")))),
         "btc_bias":       btc_bias,
         "btcd_trend":     btcd_trend,
         "btc_ltf_dir":    btc_ltf_dir,
