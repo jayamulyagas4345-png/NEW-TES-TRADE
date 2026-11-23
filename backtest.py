@@ -971,7 +971,7 @@ def summarize(rows, args, pairs, steps, n_open_end, errs):
     if EXP_SINGLE_TP:
         _cfg += f" | SINGLE_TP={bot.RR_GRADE_B:g}R (tanpa partial)"
     _cfg += f" | adx_max={getattr(bot, 'TREND_GATE_ADX_MAX', 0):g} fvg_only_block={'ON' if getattr(bot, 'ENTRY_BLOCK_FVG_ONLY', False) else 'OFF'}"
-    _cfg += f" | research={'ON' if getattr(bot, 'RESEARCH_MODE', False) else 'OFF'} retest_zone={getattr(bot, 'HTF_RETEST_ZONE_MODE', 0)}/src{getattr(bot, 'HTF_RETEST_ZONE_SRC', 0)}/pick{getattr(bot, 'RZ_OB_PICK', 0)} struct_filter={'ON' if getattr(bot, 'STRUCT_FILTER_LTF', False) else 'OFF'} sl_buffer={getattr(bot, 'SL_BUFFER_ATR_MULT', 0):g}xATR dirs={'+'.join(sorted(getattr(bot, 'EDGE_ALLOWED_DIRS', [])))}"
+    _cfg += f" | research={'ON' if getattr(bot, 'RESEARCH_MODE', False) else 'OFF'} retest_zone={getattr(bot, 'HTF_RETEST_ZONE_MODE', 0)}/src{getattr(bot, 'HTF_RETEST_ZONE_SRC', 0)}/pick{getattr(bot, 'RZ_OB_PICK', 0)} regime_aligned={'ON' if getattr(bot, 'REGIME_REQUIRE_ALIGNED', False) else 'OFF'} struct_filter={'ON' if getattr(bot, 'STRUCT_FILTER_LTF', False) else 'OFF'} sl_buffer={getattr(bot, 'SL_BUFFER_ATR_MULT', 0):g}xATR dirs={'+'.join(sorted(getattr(bot, 'EDGE_ALLOWED_DIRS', [])))}"
     L.append(f"Config    : {_cfg}")
     if getattr(args, "random_entry", False):
         L.append(f"MODE      : *** BASELINE ACAK *** seed={args.seed} prob={args.rand_prob:g} "
@@ -1100,6 +1100,8 @@ def main():
                     help="main.HTF_RETEST_ZONE_MODE: 0 = ikut file | 1 = hanya zona retest HTF | 2 = OB/FVG 30m atau zona retest HTF")
     ap.add_argument("--zone-src", type=int, default=-1,
                     help="main.HTF_RETEST_ZONE_SRC: 0 = band level swing 1h | 1 = OB gaya LuxAlgo 1h | 2 = OB gaya LuxAlgo 30m | -1 = ikut file")
+    ap.add_argument("--regime-aligned", type=int, default=-1,
+                    help="main.REGIME_REQUIRE_ALIGNED: 1 = entry hanya kalau regime searah (LONG di BULL_REGIME, SHORT di BEAR_REGIME) | 0 = off | -1 = ikut file")
     ap.add_argument("--zone-pick", type=int, default=-1,
                     help="main.RZ_OB_PICK: 0 = OB terdekat | 1 = OB asal impuls | -1 = ikut file")
     ap.add_argument("--research", type=int, default=-1,
@@ -1153,6 +1155,8 @@ def main():
         bot.HTF_RETEST_ZONE_SRC = int(args.zone_src)
     if args.zone_pick >= 0:
         bot.RZ_OB_PICK = int(args.zone_pick)
+    if args.regime_aligned >= 0:
+        bot.REGIME_REQUIRE_ALIGNED = bool(args.regime_aligned)
     if args.sl_buffer and args.sl_buffer > 0:
         bot.SL_BUFFER_ATR_MULT = float(args.sl_buffer)
     if args.be_at_r and args.be_at_r > 0:
