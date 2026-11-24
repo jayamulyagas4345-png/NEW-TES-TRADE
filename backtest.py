@@ -971,7 +971,7 @@ def summarize(rows, args, pairs, steps, n_open_end, errs):
     if EXP_SINGLE_TP:
         _cfg += f" | SINGLE_TP={bot.RR_GRADE_B:g}R (tanpa partial)"
     _cfg += f" | adx_max={getattr(bot, 'TREND_GATE_ADX_MAX', 0):g} fvg_only_block={'ON' if getattr(bot, 'ENTRY_BLOCK_FVG_ONLY', False) else 'OFF'}"
-    _cfg += f" | research={'ON' if getattr(bot, 'RESEARCH_MODE', False) else 'OFF'} retest_zone={getattr(bot, 'HTF_RETEST_ZONE_MODE', 0)}/src{getattr(bot, 'HTF_RETEST_ZONE_SRC', 0)}/pick{getattr(bot, 'RZ_OB_PICK', 0)} regime_aligned={'ON' if getattr(bot, 'REGIME_REQUIRE_ALIGNED', False) else 'OFF'} demand_long={getattr(bot, 'HTF_DEMAND_MODE', 0)} struct_filter={'ON' if getattr(bot, 'STRUCT_FILTER_LTF', False) else 'OFF'} sl_buffer={getattr(bot, 'SL_BUFFER_ATR_MULT', 0):g}xATR dirs={'+'.join(sorted(getattr(bot, 'EDGE_ALLOWED_DIRS', [])))}"
+    _cfg += f" | research={'ON' if getattr(bot, 'RESEARCH_MODE', False) else 'OFF'} retest_zone={getattr(bot, 'HTF_RETEST_ZONE_MODE', 0)}/src{getattr(bot, 'HTF_RETEST_ZONE_SRC', 0)}/pick{getattr(bot, 'RZ_OB_PICK', 0)} regime_aligned={'ON' if getattr(bot, 'REGIME_REQUIRE_ALIGNED', False) else 'OFF'} demand_long={getattr(bot, 'HTF_DEMAND_MODE', 0)} supply_short={getattr(bot, 'HTF_SUPPLY_MODE', 0)} struct_filter={'ON' if getattr(bot, 'STRUCT_FILTER_LTF', False) else 'OFF'} sl_buffer={getattr(bot, 'SL_BUFFER_ATR_MULT', 0):g}xATR dirs={'+'.join(sorted(getattr(bot, 'EDGE_ALLOWED_DIRS', [])))}"
     L.append(f"Config    : {_cfg}")
     if getattr(args, "random_entry", False):
         L.append(f"MODE      : *** BASELINE ACAK *** seed={args.seed} prob={args.rand_prob:g} "
@@ -1102,6 +1102,8 @@ def main():
                     help="main.HTF_RETEST_ZONE_SRC: 0 = band level swing 1h | 1 = OB gaya LuxAlgo 1h | 2 = OB gaya LuxAlgo 30m | -1 = ikut file")
     ap.add_argument("--demand-long", type=int, default=-1,
                     help="main.HTF_DEMAND_MODE: 1 = LONG di demand 1D + reaksi buyer 30m (tanpa BOS/HH+HL) | 2 = demand 1W | 0 = off | -1 = ikut file")
+    ap.add_argument("--supply-short", type=int, default=-1,
+                    help="main.HTF_SUPPLY_MODE: 1 = SHORT di supply (OB bearish LuxAlgo) zona 1H + reaksi seller 30m (tanpa BOS/LH+LL) | 2 = zona 4H | 3 = 1D | 4 = 1W | 0 = off | -1 = ikut file")
     ap.add_argument("--regime-aligned", type=int, default=-1,
                     help="main.REGIME_REQUIRE_ALIGNED: 1 = entry hanya kalau regime searah (LONG di BULL_REGIME, SHORT di BEAR_REGIME) | 0 = off | -1 = ikut file")
     ap.add_argument("--zone-pick", type=int, default=-1,
@@ -1161,6 +1163,8 @@ def main():
         bot.REGIME_REQUIRE_ALIGNED = bool(args.regime_aligned)
     if args.demand_long >= 0:
         bot.HTF_DEMAND_MODE = int(args.demand_long)
+    if args.supply_short >= 0:
+        bot.HTF_SUPPLY_MODE = int(args.supply_short)
     if args.sl_buffer and args.sl_buffer > 0:
         bot.SL_BUFFER_ATR_MULT = float(args.sl_buffer)
     if args.be_at_r and args.be_at_r > 0:
@@ -1302,6 +1306,11 @@ def main():
         text += ("\n\nDIAGNOSA DEMAND-LONG (mode %s):\n  dicek (tiap analisa)     : %d\n  data zona gagal/kurang   : %d\n"
                  "  tidak ada OB bullish     : %d\n  zona kesentuh + di atas  : %d\n  lolos reaksi buyer+bullish: %d\n  jadi sinyal              : %d"
                  % (bot.HTF_DEMAND_MODE, _z.get("checks", 0), _z.get("fetch_fail", 0), _z.get("no_bull_ob", 0), _z.get("touched", 0), _z.get("after_bos", 0), _z.get("signals", 0)))
+    if getattr(bot, "HTF_SUPPLY_MODE", 0):
+        _s = getattr(bot, "SZ_STATS", {})
+        text += ("\n\nDIAGNOSA SUPPLY-SHORT (mode %s):\n  dicek (tiap analisa)     : %d\n  data zona gagal/kurang   : %d\n"
+                 "  tidak ada OB bearish     : %d\n  zona kesentuh + di bawah : %d\n  lolos reaksi seller+bear : %d\n  jadi sinyal              : %d"
+                 % (bot.HTF_SUPPLY_MODE, _s.get("checks", 0), _s.get("fetch_fail", 0), _s.get("no_bear_ob", 0), _s.get("touched", 0), _s.get("after_bos", 0), _s.get("signals", 0)))
     bot.analyze_pair = _orig_ap
     single = bool(SINGLE_FILE) and not args.tag     # run dari Telegram (--tag tg) tetap 3 file
     if single:
