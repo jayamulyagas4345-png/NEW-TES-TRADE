@@ -1101,7 +1101,7 @@ def main():
     ap.add_argument("--zone-src", type=int, default=-1,
                     help="main.HTF_RETEST_ZONE_SRC: 0 = band level swing 1h | 1 = OB gaya LuxAlgo 1h | 2 = OB gaya LuxAlgo 30m | -1 = ikut file")
     ap.add_argument("--demand-long", type=int, default=-1,
-                    help="main.HTF_DEMAND_MODE: 1 = LONG di demand 1D + reaksi 30m | 2 = demand 1W | 0 = off | -1 = ikut file")
+                    help="main.HTF_DEMAND_MODE: 1 = LONG di demand 1D + reaksi buyer 30m (tanpa BOS/HH+HL) | 2 = demand 1W | 0 = off | -1 = ikut file")
     ap.add_argument("--regime-aligned", type=int, default=-1,
                     help="main.REGIME_REQUIRE_ALIGNED: 1 = entry hanya kalau regime searah (LONG di BULL_REGIME, SHORT di BEAR_REGIME) | 0 = off | -1 = ikut file")
     ap.add_argument("--zone-pick", type=int, default=-1,
@@ -1297,6 +1297,11 @@ def main():
     SIM.fh.close()
     text, summary = summarize(SIM.rows, args, pairs, total_steps, n_open_end, SIM.errs)
     text = text + "\n" + SKIPS.report()
+    if getattr(bot, "HTF_DEMAND_MODE", 0):
+        _z = getattr(bot, "DZ_STATS", {})
+        text += ("\n\nDIAGNOSA DEMAND-LONG (mode %s):\n  dicek (tiap analisa)     : %d\n  data zona gagal/kurang   : %d\n"
+                 "  tidak ada OB bullish     : %d\n  zona kesentuh + di atas  : %d\n  lolos reaksi buyer+bullish: %d\n  jadi sinyal              : %d"
+                 % (bot.HTF_DEMAND_MODE, _z.get("checks", 0), _z.get("fetch_fail", 0), _z.get("no_bull_ob", 0), _z.get("touched", 0), _z.get("after_bos", 0), _z.get("signals", 0)))
     bot.analyze_pair = _orig_ap
     single = bool(SINGLE_FILE) and not args.tag     # run dari Telegram (--tag tg) tetap 3 file
     if single:
