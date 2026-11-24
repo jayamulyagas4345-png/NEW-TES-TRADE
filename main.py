@@ -6283,7 +6283,16 @@ DZ_SKIP_SCORE_GATE     = True   # berlaku juga untuk SHORT di supply (HTF_SUPPLY
 # 0 = mati | 1 = zona dari chart 1H | 2 = zona 4H | 3 = zona 1D | 4 = zona 1W. Di backtest: token `sz1` .. `sz4`.
 HTF_SUPPLY_MODE       = 0
 SZ_TF_MAP             = {1: "1h", 2: "4h", 3: "1d", 4: "1w"}
-SZ_STATS = {"checks": 0, "fetch_fail": 0, "no_bear_ob": 0, "touched": 0, "after_bos": 0, "after_score": 0, "signals": 0}   # diagnosa (dibaca backtest)
+SZ_STATS = {"checks": 0, "fetch_fail": 0, "no_bear_ob": 0, "touched": 0, "after_bos": 0, "after_score": 0, "signals": 0,
+            "block_di": 0, "block_btc": 0}   # diagnosa (dibaca backtest)
+# PENGAMAN SHORT di supply (2026-11-24, dari backtest 30 hari 11 Okt-10 Nov 2024: 218 trade supply, WR 37%, -132 USDT).
+# Dua penyebab rugi terbesar: (1) SHORT saat BTC 15m sedang naik (58 trade, WR 15%, -195 USDT) dan
+# (2) SHORT padahal tren 1h (DI) melawan (89 trade yang sangat melawan, WR 24%, -208 USDT).
+# Dengan dua syarat ini di log yang sama: 96 trade, WR 56%, +172 USDT. BELUM diuji di periode lain.
+# Backtest: token `sg0` = pengaman mati (hasil seperti sebelumnya) | `sg1` = nyala. Tanpa token = ikut nilai di bawah.
+SZ_REQUIRE_BTC_NOT_UP = True    # SHORT di supply ditolak kalau BTC 15m sedang naik (BULLISH)
+SZ_REQUIRE_HTF_DI     = True    # SHORT di supply ditolak kalau tren 1h melawan (selisih DI < SZ_MIN_DI_GAP)
+SZ_MIN_DI_GAP         = 0.0     # 0 = tren 1h minimal tidak melawan SHORT; naikkan (mis. 5) kalau mau tren 1h turun jelas
 RZ_OB_SIZE            = 5       # size struktur internal LuxAlgo
 # Pilih OB: 0 = terdekat dari harga | 1 = 'origin' = OB dengan pergerakan lanjutan terbesar sesudahnya (asal impuls). Token `zp0`/`zp1`.
 RZ_OB_PICK            = 1
@@ -16225,6 +16234,7 @@ def cmd_backtest(parts):
       /backtest 60 15 2026-10-11 randsmc  → acak dgn struktur exit mirip smc2 (TP1 1R, TP2 3R, SL 1.5xATR)
       /backtest 30 15 dz1  → LONG di demand 1D + reaksi buyer (tanpa BOS) | dz2 = demand 1W
       /backtest 30 15 sz1  → SHORT di supply (OB merah LuxAlgo) 1H + reaksi seller (tanpa BOS) | sz2=4H sz3=1D sz4=1W
+      /backtest 30 15 sz1 sg0 → sama, tapi pengaman SHORT (BTC naik / tren 1h melawan) DIMATIKAN, untuk pembanding
     /backtest status | stop | last
     Berjalan sebagai proses TERPISAH (backtest.py) — tidak menyentuh trade_log.json,
     bot_state.json, atau order Binance. Log tersimpan di <data_dir>/backtests/.
@@ -16289,7 +16299,7 @@ def cmd_backtest(parts):
             _tok = parts[4].strip().lower()
             # Token ke-5 boleh langsung opsi (sr1.2 / pb / dl5 / dw5 / mt3) tanpa
             # harus isi mode strategi — mode default (SMC bot) dipakai.
-            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz|sz)\d+(?:\.\d+)?", _tok):
+            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz|sz|sg)\d+(?:\.\d+)?", _tok):
                 parts = list(parts[:4]) + ["-"] + list(parts[4:])
                 _tok = "-"
             _m = _re.fullmatch(r"(rand|randsmc)(\d*)", _tok)
@@ -16360,17 +16370,17 @@ def cmd_backtest(parts):
                     extra_args += ["--ema-pullback", "gate"]
                     mode_label += " pb"
                     continue
-                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz|sz)(\d+(?:\.\d+)?)", _x.strip().lower())
+                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz|sz|sg)(\d+(?:\.\d+)?)", _x.strip().lower())
                 if not _lm:
                     raise ValueError("limit")
-                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick", "rg": "--regime-aligned", "dz": "--demand-long", "sz": "--supply-short"}[_lm.group(1)]
+                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick", "rg": "--regime-aligned", "dz": "--demand-long", "sz": "--supply-short", "sg": "--supply-guard"}[_lm.group(1)]
                 _val = _lm.group(2)
                 if _lm.group(1) == "mt":
                     _val = str(int(float(_val)))
                 extra_args += [_flag, _val]
                 mode_label += f" {_lm.group(1)}{_lm.group(2)}"
     except ValueError:
-        send_telegram_raw("❌ Format: <code>/backtest [hari] [all|jumlah|BTCUSDT,ETHUSDT] [YYYY-MM-DD akhir periode] [rand|rand2|randsmc|smc2|smc2flip|smc2:h4|smc2:btc|smc2:adx|sd|sdflip|ob|obflip|htf|htfflip|fund|fundflip] [pb sr<R> dl<%> dw<%> mt<n> dz1 sz1]</code>")
+        send_telegram_raw("❌ Format: <code>/backtest [hari] [all|jumlah|BTCUSDT,ETHUSDT] [YYYY-MM-DD akhir periode] [rand|rand2|randsmc|smc2|smc2flip|smc2:h4|smc2:btc|smc2:adx|sd|sdflip|ob|obflip|htf|htfflip|fund|fundflip] [pb sr<R> dl<%> dw<%> mt<n> dz1 sz1 sg0]</code>")
         return
     days = max(1, min(days, 90))   # 2026-11-17: 60 → 90 (batas backtest.py = 90)
     cmd = _backtest_build_cmd(days, pairs, out_dir, end, rand_seed, extra_args)
@@ -17563,6 +17573,10 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     except Exception:
         adx_htf, pdi_htf, ndi_htf = 25.0, 0.0, 0.0
     di_gap_htf = (pdi_htf - ndi_htf) if trade_direction == "BULLISH" else (ndi_htf - pdi_htf)
+    if _sz_short and SZ_REQUIRE_HTF_DI and di_gap_htf < SZ_MIN_DI_GAP:
+        SZ_STATS["block_di"] += 1
+        print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: tren {htf_tf} melawan SHORT (DI gap {di_gap_htf:.1f} < {SZ_MIN_DI_GAP:g}), skip")
+        return
     if TREND_GATE_ON and not RESEARCH_MODE and not _zone_rev:
         _dir_s = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if TREND_GATE_ADX_MIN > 0 and adx_htf < TREND_GATE_ADX_MIN:
@@ -17927,6 +17941,11 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     if corr_blocked:
         dir_str = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  🚫 [{label}] {pair} {dir_str} — BTCD CORR BLOK: {corr_reason}")
+        return
+
+    if _sz_short and SZ_REQUIRE_BTC_NOT_UP and btc_ltf_dir == "BULLISH":
+        SZ_STATS["block_btc"] += 1
+        print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: BTC {BTC_LTF_TF} sedang naik, skip")
         return
 
     # corr_score dimasukkan ke macro_pts sebagai bonus/penalty tambahan
