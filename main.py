@@ -6281,7 +6281,7 @@ DZ_SKIP_SCORE_GATE     = True   # berlaku juga untuk SHORT di supply (HTF_SUPPLY
 # Tanpa BOS / LH+LL. SL di atas atap zona / wick tertinggi sentuhan (+ buffer RZ_SL_BUF_ATR x ATR), TP = SINGLE_TP_R_MULT.
 # Jalur ini MENGGANTIKAN gate arah HTF seperti mode demand (setup reversal).
 # 0 = mati | 1 = zona dari chart 1H | 2 = zona 4H | 3 = zona 1D | 4 = zona 1W. Di backtest: token `sz1` .. `sz4`.
-HTF_SUPPLY_MODE       = 0
+HTF_SUPPLY_MODE       = 1       # DINYALAKAN 2026-11-24 (SHORT di zona merah 1H, dengan pengaman SZ_REQUIRE_*). Pakai bersama /maxopentrade 3. Ubah ke 0 untuk mematikan.
 SZ_TF_MAP             = {1: "1h", 2: "4h", 3: "1d", 4: "1w"}
 SZ_STATS = {"checks": 0, "fetch_fail": 0, "no_bear_ob": 0, "touched": 0, "after_bos": 0, "after_score": 0, "signals": 0,
             "block_di": 0, "block_btc": 0}   # diagnosa (dibaca backtest)
