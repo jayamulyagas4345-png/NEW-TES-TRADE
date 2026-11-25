@@ -15,6 +15,7 @@
 ║    • /status     — status bot & posisi aktif                             ║
 ║    • /closeallposition — tutup semua posisi sekarang                     ║
 ║    • /maxopentrade <n> — set max posisi bersamaan                        ║
+║    • /pairs [all|N|BTC,ETH] — atur pair yang dipantau (bawaan: semua)    ║
 ║    • /maxtradesperday <n> — batas trade dibuka per hari (UTC, 0=off)      ║
 ║    • /setmarginratio <persen> — max loss % per trade jika SL kena         ║
 ║    • /resumeorpause, /start, /resetpnl, /help (kontrol dasar)             ║
@@ -208,6 +209,7 @@ def _serialize_state() -> dict:
         "DAILY_LOSS_LIMIT_PCT":      DAILY_LOSS_LIMIT_PCT,
         "DAILY_WIN_LIMIT_PCT":       DAILY_WIN_LIMIT_PCT,
         "MAX_TRADES_PER_DAY":        MAX_TRADES_PER_DAY,
+        "_PAIR_SELECTION":           (list(_PAIR_SELECTION) if _PAIR_SELECTION else None),
         "_trades_today_state":       dict(_trades_today_state),
         "bot_state":                 bs,
         "_daily_limit_state":        dls,
@@ -247,6 +249,7 @@ def load_state():
     global _user_set_max_trades, bot_paused, MIN_SCORE_CUSTOM, MIN_SCORE_RELAXED_CUSTOM
     global BTC_CORR_FILTER_ON, _ACTIVE_MODE_FILTER, _DIRECTION_FILTER, TP1_PARTIAL
     global STOCH_POSITION_GATE_ENABLED
+    global _PAIR_SELECTION
     global DAILY_LOSS_LIMIT_PCT, DAILY_WIN_LIMIT_PCT
     global MAX_TRADES_PER_DAY, _trades_today_state
     global bot_state, _daily_limit_state, _sent_signal_hashes, _cooldown_map
@@ -281,6 +284,10 @@ def load_state():
         # toggle). Kalau False, btcd_trend dipaksa "FLAT" -> macro_pts 0 -> skor beda.
         BTC_CORR_FILTER_ON       = True
         STOCH_POSITION_GATE_ENABLED = data.get("STOCH_POSITION_GATE_ENABLED", STOCH_POSITION_GATE_ENABLED)
+        _ps = data.get("_PAIR_SELECTION")
+        if isinstance(_ps, list):
+            _ps = [p for p in _ps if p in BASE_PAIRS]
+            _PAIR_SELECTION = _ps or None
         # 1:1 DENGAN BASE: filter mode/arah/super-scalper TIDAK di-restore dari
         # state lama — dikunci ke default ("ALL"/"ALL"/False) supaya tidak ada
         # filter tersembunyi yang mengubah sinyal.
@@ -971,12 +978,16 @@ BASE_PAIRS = [
     "HYPEUSDT",
 ]
 
+# Pair yang dipantau bot, diatur lewat command /pairs (tersimpan di bot_state.json).
+# None = semua BASE_PAIRS | list = hanya pair itu (selalu bagian dari BASE_PAIRS).
+_PAIR_SELECTION = None
+
 def get_active_pairs() -> list:
-    """Pair aktif = BASE_PAIRS (1:1 dengan base signal-only).
+    """Pair aktif = BASE_PAIRS (1:1 dengan base signal-only), atau pilihan /pairs kalau diatur.
     Difilter ke symbol yang valid di exchange aktif (testnet punya daftar
     lebih sempit) — filter ini hanya membuang pair yang MEMANG tidak bisa
     di-trade di exchange itu, tidak mengubah logika sinyal."""
-    base = list(BASE_PAIRS)
+    base = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
     if not _exchange_info_cache:
         return base
     filtered = [p for p in base if p in _exchange_info_cache]
@@ -15514,6 +15525,126 @@ def cmd_setscoreupto(parts: list):
     )
 
 
+def _pairs_norm(tok: str):
+    """BTC -> BTCUSDT, shib -> 1000SHIBUSDT (kalau ada di daftar bot)."""
+    t = tok.strip().upper().replace("/", "").replace("-", "").replace("_", "")
+    if not t:
+        return None
+    if not t.endswith("USDT"):
+        t += "USDT"
+    if t in BASE_PAIRS:
+        return t
+    alt = "1000" + t
+    return alt if alt in BASE_PAIRS else t
+
+
+def _pairs_parse(tokens: list):
+    """-> (pair valid urut sesuai BASE_PAIRS, token yang tidak dikenal)."""
+    raw = []
+    for a in tokens:
+        raw += [x for x in a.replace(",", " ").split() if x.strip()]
+    ok, bad = set(), []
+    for r in raw:
+        p = _pairs_norm(r)
+        if p in BASE_PAIRS:
+            ok.add(p)
+        else:
+            bad.append(r)
+    return [p for p in BASE_PAIRS if p in ok], bad
+
+
+def _pairs_status_text() -> str:
+    shown = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
+    total = len(BASE_PAIRS)
+    if _PAIR_SELECTION:
+        head = f"🎯 <b>TERPILIH</b> — {len(shown)} dari {total} pair"
+    else:
+        head = f"🌐 <b>SEMUA</b> — {total} pair"
+    names = ", ".join(p.replace("USDT", "") for p in shown)
+    try:
+        n_valid = len(get_active_pairs())
+    except Exception:
+        n_valid = len(shown)
+    return (
+        f"📡 <b>Pair yang Dipantau</b>\n"
+        f"{'─'*34}\n"
+        f"{head}\n"
+        f"{names}\n"
+        f"{'─'*34}\n"
+        f"✅ Dipindai di mode {BOT_MODE}: <b>{n_valid}</b> pair\n"
+        f"ℹ️ Berlaku mulai putaran scan berikutnya. Posisi yang sudah terbuka tetap dikelola sampai selesai."
+    )
+
+
+def cmd_pairs(parts: list):
+    """
+    /pairs                    → lihat pair yang dipantau sekarang
+    /pairs all                → pantau SEMUA pair
+    /pairs 15                 → 15 pair pertama di daftar bot
+    /pairs BTC,ETH,SOL        → hanya pair ini (nama pendek boleh: BTC, shib, pepe)
+    /pairs add DOGE,SUI       → tambah pair ke pilihan sekarang
+    /pairs remove DOGE        → keluarkan pair dari pilihan sekarang
+    Tanpa restart; tersimpan di bot_state.json.
+    """
+    global _PAIR_SELECTION
+    args = [a for a in parts[1:] if a.strip()]
+    usage = (
+        "\n\nCara pakai:\n"
+        "<code>/pairs all</code> → semua pair\n"
+        "<code>/pairs 15</code> → 15 pair pertama\n"
+        "<code>/pairs BTC,ETH,SOL</code> → hanya pair ini\n"
+        "<code>/pairs add DOGE</code> / <code>/pairs remove DOGE</code>"
+    )
+    if not args:
+        send_telegram_raw(_pairs_status_text() + usage)
+        return
+
+    first = args[0].lower()
+    total = len(BASE_PAIRS)
+
+    if first in ("all", "semua", "reset"):
+        new_sel = None
+    elif first.isdigit():
+        n = int(first)
+        if not (1 <= n <= total):
+            send_telegram_raw(f"⚠️ Jumlah pair harus antara <b>1</b> sampai <b>{total}</b>.")
+            return
+        new_sel = None if n == total else list(BASE_PAIRS)[:n]
+    elif first in ("add", "tambah", "remove", "hapus", "del"):
+        picked, bad = _pairs_parse(args[1:])
+        if bad or not picked:
+            send_telegram_raw(
+                "⚠️ Pair tidak dikenal: <b>" + (", ".join(bad) if bad else "(kosong)") + "</b>\n"
+                "Pair harus ada di daftar bot. Contoh: <code>/pairs add DOGE,SUI</code>"
+            )
+            return
+        cur = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
+        if first in ("add", "tambah"):
+            cur = [p for p in BASE_PAIRS if p in set(cur) | set(picked)]
+        else:
+            cur = [p for p in cur if p not in set(picked)]
+        if not cur:
+            send_telegram_raw("⚠️ Minimal harus ada <b>1 pair</b> yang dipantau.")
+            return
+        new_sel = None if len(cur) == total else cur
+    else:
+        picked, bad = _pairs_parse(args)
+        if bad or not picked:
+            send_telegram_raw(
+                "⚠️ Pair tidak dikenal: <b>" + (", ".join(bad) if bad else "(kosong)") + "</b>\n"
+                "Pair harus ada di daftar bot. Contoh: <code>/pairs BTC,ETH,SOL</code>"
+            )
+            return
+        new_sel = None if len(picked) == total else picked
+
+    old_txt = f"{len(_PAIR_SELECTION)} pair" if _PAIR_SELECTION else "semua pair"
+    _PAIR_SELECTION = new_sel
+    save_state()
+    new_txt = f"{len(new_sel)} pair" if new_sel else "semua pair"
+    print(f"⚙️ /pairs diubah: {old_txt} → {new_txt}")
+    send_telegram_raw(f"✅ <b>Pair Diubah</b>: {old_txt} → <b>{new_txt}</b>\n\n" + _pairs_status_text())
+
+
 def cmd_maxopentrade(parts: list):
     """
     /maxopentrade <jumlah>
@@ -16128,6 +16259,7 @@ def cmd_menu():
         [{"text": "📊 Recap", "callback_data": "/recap"}],
         [{"text": "🧹 Cleanup Orders", "callback_data": "/cleanuporders"},
          {"text": "🧹 Cleanup Duplicate", "callback_data": "/cleanupduplicate"}],
+        [{"text": "📡 Pairs", "callback_data": "/pairs"}],
         [{"text": "❓ Help", "callback_data": "/help"}],
     ]
     send_message_with_keyboard("🤖 <b>Menu Bot</b> — tap tombol di bawah:", keyboard)
@@ -16220,6 +16352,7 @@ def cmd_backtest(parts):
       /backtest               → 7 hari, 15 pair pertama
       /backtest 14 all        → 14 hari, semua pair
       /backtest 7 BTCUSDT,ETHUSDT
+      /backtest 30 live sz1   → pair SAMA dengan yang dipantau live (lihat /pairs)
       /backtest 30 15 2026-10-12   → 30 hari SEBELUM 12 Okt 2026 (UTC)
       /backtest 60 15 2026-10-11 rand2 → BASELINE ACAK (seed 2): entry acak tanpa sinyal SMC,
                                          exit/fee/risk sama. Pembanding "apakah sinyal bot punya edge?"
@@ -16290,6 +16423,8 @@ def cmd_backtest(parts):
             days = int(parts[1])
         if len(parts) > 2:
             pairs = parts[2]
+            if pairs.lower() == "live":
+                pairs = ",".join(get_active_pairs())   # pair yang sama dengan yang dipantau bot (/pairs)
         if len(parts) > 3:
             end = parts[3].strip()
             import re as _re
@@ -16497,6 +16632,8 @@ def handle_command(text: str):
         cmd_setmarginratio(parts)
     elif cmd == "/maxopentrade":
         cmd_maxopentrade(parts)
+    elif cmd == "/pairs":
+        cmd_pairs(parts)
     elif cmd in ("/setscoreupto", "/setscore"):
         cmd_setscoreupto(parts)
     elif cmd in ("/maxtradesperday", "/maxtradeperday", "/maxtradeday"):
@@ -16586,6 +16723,13 @@ def handle_command(text: str):
             "/maxopentrade &lt;jumlah&gt;\n"
             "  Ubah max posisi yang boleh dibuka bersamaan (1–20), contoh:\n"
             "  <code>/maxopentrade 3</code>\n\n"
+            "/pairs\n"
+            "  Atur pair yang dipantau bot, tanpa restart (berlaku di scan berikutnya):\n"
+            "  <code>/pairs</code> → lihat pair sekarang\n"
+            "  <code>/pairs all</code> → semua pair\n"
+            "  <code>/pairs 15</code> → 15 pair pertama\n"
+            "  <code>/pairs BTC,ETH,SOL</code> → hanya pair ini\n"
+            "  <code>/pairs add DOGE</code> / <code>/pairs remove DOGE</code>\n\n"
             "/maxtradesperday &lt;jumlah&gt;\n"
             "  Batas jumlah trade yang boleh DIBUKA per hari UTC (0 = tanpa batas).\n"
             "  Yang dihitung hanya order yang TERISI; reset otomatis UTC 00:00,\n"
@@ -18526,7 +18670,7 @@ def main():
     print(f"⚡ Leverage    : Auto-tier (5x-20x by price) | Max Trades: {MAX_OPEN_TRADES} (dynamic, scale otomatis)")
     print(f"🚀 Scan Config : interval={SCAN_INTERVAL}s | workers={MAX_WORKERS}  ← VERIFIKASI VERSI DEPLOY DI SINI")
     print()
-    print("TELEGRAM COMMANDS: /start /pnl /status /resumeorpause /closeallposition /changeliveordemo /setmarginratio /maxopentrade /maxtradesperday /resetpnl /cleanuporders /help")
+    print("TELEGRAM COMMANDS: /start /pnl /status /resumeorpause /closeallposition /changeliveordemo /setmarginratio /maxopentrade /maxtradesperday /pairs /resetpnl /cleanuporders /help")
     print("=" * 70)
 
     # Kirim IP publik ke Telegram + countdown 30 detik untuk whitelist
@@ -18602,6 +18746,7 @@ def main():
         f"  /changeliveordemo — ganti LIVE/DEMO (saat ini: <b>{mode_em}</b>)\n"
         f"  /setmarginratio — set max SL loss % per trade\n"
         f"  /maxopentrade — ubah max posisi\n"
+        f"  /pairs — atur pair yang dipantau\n"
         f"  /maxtradesperday — batas trade per hari\n"
         f"{'─'*38}\n"
         f"Ketik <b>/start</b> untuk konek ke Binance & mulai trading.\n"
