@@ -6295,11 +6295,20 @@ DZ_SKIP_SCORE_GATE     = True   # berlaku juga untuk SHORT di supply (HTF_SUPPLY
 HTF_SUPPLY_MODE       = 1       # DINYALAKAN 2026-11-24 (SHORT di zona merah 1H, dengan pengaman SZ_REQUIRE_*). Pakai bersama /maxopentrade 3. Ubah ke 0 untuk mematikan.
 SZ_TF_MAP             = {1: "1h", 2: "4h", 3: "1d", 4: "1w"}
 SZ_STATS = {"checks": 0, "fetch_fail": 0, "no_bear_ob": 0, "touched": 0, "after_bos": 0, "after_score": 0, "signals": 0,
-            "block_di": 0, "block_btc": 0}   # diagnosa (dibaca backtest)
+            "block_di": 0, "block_btc": 0, "block_chase": 0, "block_sl": 0}   # diagnosa (dibaca backtest)
 # PENGAMAN SHORT di supply (2026-11-24, dari backtest 30 hari 11 Okt-10 Nov 2024: 218 trade supply, WR 37%, -132 USDT).
 # Dua penyebab rugi terbesar: (1) SHORT saat BTC 15m sedang naik (58 trade, WR 15%, -195 USDT) dan
 # (2) SHORT padahal tren 1h (DI) melawan (89 trade yang sangat melawan, WR 24%, -208 USDT).
-# Dengan dua syarat ini di log yang sama: 96 trade, WR 56%, +172 USDT. BELUM diuji di periode lain.
+# Dengan dua syarat ini di log yang sama: 96 trade, WR 56%, +172 USDT (IN-SAMPLE).
+# UJI PERIODE LAIN (2026-11-25, 17 Feb-17 May 2024, 14 pair): 188 trade, WR 41.0%, PF 0.98, -12 USDT.
+#   Entry acak (baseline rand2, n=40) di jendela sama: WR 35%, PF 0.76 -> belum bisa dibedakan dari acak.
+#   WR 56% -> 41% = tanda overfit. Jangan setel ulang angka di sini dari satu jendela; validasi di banyak jendela.
+# GUARD ENTRY (2026-11-25, hipotesis STRUKTURAL, BUKAN hasil tuning): syarat reaksi seller sangat longgar (ekor atas >= 30%
+# ATAU turun >= 0.3 ATR), jadi sinyal bisa muncul jauh setelah zona ditinggalkan: entry market mengejar harga, SL tetap
+# di atas high 8 jam terakhir -> SL lebar, zona tidak lagi berperan. Dua guard di bawah memaksa entry tetap dekat zona.
+# 0 = nonaktif (perilaku lama) untuk A/B test. Statistik: SZ_STATS["block_chase"] / ["block_sl"].
+SZ_MAX_CHASE_ATR      = 0.75    # skip kalau harga sudah > N x ATR(entry TF) DI BAWAH dasar zona (mengejar)
+SZ_MAX_SL_ATR         = 4.0     # skip kalau jarak SL > N x ATR(entry TF) (batas kewajaran, bukan hasil tuning)
 # Backtest: token `sg0` = pengaman mati (hasil seperti sebelumnya) | `sg1` = nyala. Tanpa token = ikut nilai di bawah.
 SZ_REQUIRE_BTC_NOT_UP = True    # SHORT di supply ditolak kalau BTC 15m sedang naik (BULLISH)
 SZ_REQUIRE_HTF_DI     = True    # SHORT di supply ditolak kalau tren 1h melawan (selisih DI < SZ_MIN_DI_GAP)
@@ -18142,6 +18151,20 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         entry, sl, tp1, tp2, rr1, rr2 = _dz_entry_sl_tp(price, _rz_lo, _dz_wick, entry_atr)
     elif _sz_short:
         entry, sl, tp1, tp2, rr1, rr2 = _sz_entry_sl_tp(price, _rz_hi, _sz_wick, entry_atr)
+        # GUARD (2026-11-25): entry harus dekat zona supply & SL tidak absurd lebar. Lihat komentar SZ_MAX_CHASE_ATR.
+        if entry_atr and entry_atr > 0:
+            _sz_chase = max(0.0, _rz_lo - price) / entry_atr
+            _sz_sl_atr = (sl - entry) / entry_atr
+            if SZ_MAX_CHASE_ATR > 0 and _sz_chase > SZ_MAX_CHASE_ATR:
+                SZ_STATS["block_chase"] += 1
+                print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: harga sudah {_sz_chase:.2f} ATR di bawah zona "
+                      f"(> {SZ_MAX_CHASE_ATR:g}, mengejar), skip")
+                return
+            if SZ_MAX_SL_ATR > 0 and _sz_sl_atr > SZ_MAX_SL_ATR:
+                SZ_STATS["block_sl"] += 1
+                print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: SL {_sz_sl_atr:.1f} ATR "
+                      f"(> {SZ_MAX_SL_ATR:g}, terlalu lebar), skip")
+                return
     elif _rz_touch:
         entry, sl, tp1, tp2, rr1, rr2 = _rz_entry_sl_tp(trade_direction, price, _rz_lo, _rz_hi, entry_atr)
 
