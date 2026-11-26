@@ -13639,9 +13639,9 @@ def _save_trade_log(log: list):
 #  VERSION STAMP — dicocokkan dengan Railway & GitHub
 #  EDIT 5 BARIS INI SETIAP KALI FILE DIUBAH (Claude juga wajib mengisinya tiap mengedit):
 # ══════════════════════════════════════════════════════════════════════════
-BOT_VERSION    = "v83-zonestudy"     # versi bot (ubah tiap rilis)
+BOT_VERSION    = "v84-zona-tp-bebas"     # versi bot (ubah tiap rilis)
 BUILD_DATE     = "2026-11-26"             # tanggal upload ke GitHub (YYYY-MM-DD)
-LAST_EDIT      = "2026-11-26 13:30 WIB"   # tanggal & jam edit TERAKHIR file ini (WIB = UTC+7)
+LAST_EDIT      = "2026-11-26 18:38 WIB"   # tanggal & jam edit TERAKHIR file ini (WIB = UTC+7)
 EDITED_BY      = "Claude - email akun: BELUM_DIISI"   # akun Claude (email) yang mengedit terakhir
 GITHUB_ACCOUNT = "ISI_AKUN_GITHUB_KAMU"   # cadangan manual jika Railway tidak mengisi owner repo
 # Sisanya otomatis dari env Railway (terisi jika deploy via integrasi GitHub).
@@ -18787,7 +18787,9 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     # 444 trade nemu rr1 di rentang [2.5, 4.0) WR cuma 18-23% (-16.4R
     # gabungan), jauh lebih jelek daripada sweet spot RR 1.5-2.0 (WR 40%,
     # +25.7R). RR di zona ini ditolak.
-    if 2.5 <= rr1 < 4.0:
+    # 2026-11-26: DIKECUALIKAN untuk mode zona (SHORT supply / LONG demand). Aturan ini dibuat dari strategi lama;
+    # untuk mode zona, TP tunggal (sr<R>) harus bebas diuji di 2R / 3R (studi zona menunjukkan RR besar layak diuji).
+    if 2.5 <= rr1 < 4.0 and not _zone_rev:
         print(f"  ⛔ [{label}] {pair} — RR {rr1:.2f} di dead-zone [2.5, 4.0) (ditolak)")
         return
 
