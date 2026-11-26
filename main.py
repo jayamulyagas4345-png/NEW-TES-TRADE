@@ -13639,9 +13639,9 @@ def _save_trade_log(log: list):
 #  VERSION STAMP — dicocokkan dengan Railway & GitHub
 #  EDIT 5 BARIS INI SETIAP KALI FILE DIUBAH (Claude juga wajib mengisinya tiap mengedit):
 # ══════════════════════════════════════════════════════════════════════════
-BOT_VERSION    = "v84-zona-tp-bebas"     # versi bot (ubah tiap rilis)
+BOT_VERSION    = "v85-petunjuk-backtest"     # versi bot (ubah tiap rilis)
 BUILD_DATE     = "2026-11-26"             # tanggal upload ke GitHub (YYYY-MM-DD)
-LAST_EDIT      = "2026-11-26 18:38 WIB"   # tanggal & jam edit TERAKHIR file ini (WIB = UTC+7)
+LAST_EDIT      = "2026-11-26 18:44 WIB"   # tanggal & jam edit TERAKHIR file ini (WIB = UTC+7)
 EDITED_BY      = "Claude - email akun: BELUM_DIISI"   # akun Claude (email) yang mengedit terakhir
 GITHUB_ACCOUNT = "ISI_AKUN_GITHUB_KAMU"   # cadangan manual jika Railway tidak mengisi owner repo
 # Sisanya otomatis dari env Railway (terisi jika deploy via integrasi GitHub).
@@ -17003,6 +17003,13 @@ def cmd_backtest(parts):
                 import html as _html
                 send_telegram_raw("❌ <b>Backtest gagal</b> (kode " + str(rc) + ")\n<pre>"
                                   + _html.escape("\n".join(tail)[-1500:]) + "</pre>")
+                if any("unrecognized arguments" in _l for _l in tail):
+                    send_telegram_raw(
+                        "💡 <b>backtest.py di server masih versi LAMA</b> (tidak mengenal kode yang baru).\n"
+                        "Upload <code>backtest_demand.py</code> dengan nama <code>backtest.py</code> (menimpa yang lama), "
+                        "di folder yang sama dengan <code>main.py</code>, lalu restart bot.\n"
+                        "Cek: header laporan backtest harus menampilkan baris <b>Diedit</b> dan versi terbaru."
+                    )
         except Exception as e:
             send_telegram_raw(f"❌ Backtest error: <code>{e}</code>")
         finally:
