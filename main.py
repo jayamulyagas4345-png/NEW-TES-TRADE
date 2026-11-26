@@ -15,7 +15,6 @@
 ║    • /status     — status bot & posisi aktif                             ║
 ║    • /closeallposition — tutup semua posisi sekarang                     ║
 ║    • /maxopentrade <n> — set max posisi bersamaan                        ║
-║    • /pairs [all|N|BTC,ETH] — atur pair yang dipantau (bawaan: semua)    ║
 ║    • /maxtradesperday <n> — batas trade dibuka per hari (UTC, 0=off)      ║
 ║    • /setmarginratio <persen> — max loss % per trade jika SL kena         ║
 ║    • /resumeorpause, /start, /resetpnl, /help (kontrol dasar)             ║
@@ -209,7 +208,6 @@ def _serialize_state() -> dict:
         "DAILY_LOSS_LIMIT_PCT":      DAILY_LOSS_LIMIT_PCT,
         "DAILY_WIN_LIMIT_PCT":       DAILY_WIN_LIMIT_PCT,
         "MAX_TRADES_PER_DAY":        MAX_TRADES_PER_DAY,
-        "_PAIR_SELECTION":           (list(_PAIR_SELECTION) if _PAIR_SELECTION else None),
         "_trades_today_state":       dict(_trades_today_state),
         "bot_state":                 bs,
         "_daily_limit_state":        dls,
@@ -249,7 +247,6 @@ def load_state():
     global _user_set_max_trades, bot_paused, MIN_SCORE_CUSTOM, MIN_SCORE_RELAXED_CUSTOM
     global BTC_CORR_FILTER_ON, _ACTIVE_MODE_FILTER, _DIRECTION_FILTER, TP1_PARTIAL
     global STOCH_POSITION_GATE_ENABLED
-    global _PAIR_SELECTION
     global DAILY_LOSS_LIMIT_PCT, DAILY_WIN_LIMIT_PCT
     global MAX_TRADES_PER_DAY, _trades_today_state
     global bot_state, _daily_limit_state, _sent_signal_hashes, _cooldown_map
@@ -284,10 +281,6 @@ def load_state():
         # toggle). Kalau False, btcd_trend dipaksa "FLAT" -> macro_pts 0 -> skor beda.
         BTC_CORR_FILTER_ON       = True
         STOCH_POSITION_GATE_ENABLED = data.get("STOCH_POSITION_GATE_ENABLED", STOCH_POSITION_GATE_ENABLED)
-        _ps = data.get("_PAIR_SELECTION")
-        if isinstance(_ps, list):
-            _ps = [p for p in _ps if p in BASE_PAIRS]
-            _PAIR_SELECTION = _ps or None
         # 1:1 DENGAN BASE: filter mode/arah/super-scalper TIDAK di-restore dari
         # state lama — dikunci ke default ("ALL"/"ALL"/False) supaya tidak ada
         # filter tersembunyi yang mengubah sinyal.
@@ -978,16 +971,12 @@ BASE_PAIRS = [
     "HYPEUSDT",
 ]
 
-# Pair yang dipantau bot, diatur lewat command /pairs (tersimpan di bot_state.json).
-# None = semua BASE_PAIRS | list = hanya pair itu (selalu bagian dari BASE_PAIRS).
-_PAIR_SELECTION = None
-
 def get_active_pairs() -> list:
-    """Pair aktif = BASE_PAIRS (1:1 dengan base signal-only), atau pilihan /pairs kalau diatur.
+    """Pair aktif = BASE_PAIRS (1:1 dengan base signal-only).
     Difilter ke symbol yang valid di exchange aktif (testnet punya daftar
     lebih sempit) — filter ini hanya membuang pair yang MEMANG tidak bisa
     di-trade di exchange itu, tidak mengubah logika sinyal."""
-    base = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
+    base = list(BASE_PAIRS)
     if not _exchange_info_cache:
         return base
     filtered = [p for p in base if p in _exchange_info_cache]
@@ -3393,6 +3382,7 @@ def _lux_order_blocks(df: pd.DataFrame, size: int = 5, swing_size: int = 50, atr
     ih_idx = il_idx = None
     prev_ih = prev_il = None
     obs = []
+    trend = 0       # bias struktur internal: +1 bullish, -1 bearish (untuk tag CHoCH vs BOS)
     for t in range(n):
         e, lvl, idx = ev_s[t]
         if e == -1:
@@ -3407,16 +3397,20 @@ def _lux_order_blocks(df: pd.DataFrame, size: int = 5, swing_size: int = 50, atr
         if t > 0:
             if ih is not None and prev_ih is not None and C[t] > ih and C[t - 1] <= prev_ih and not ih_cr and ih != sh:
                 ih_cr = True
+                tag = "CHOCH" if trend == -1 else "BOS"
+                trend = 1
                 seg = PL[ih_idx:t]
                 if len(seg):
                     j = ih_idx + int(np.argmin(seg))
-                    obs.insert(0, {"top": PH[j], "bot": PL[j], "bias": 1, "idx": j})
+                    obs.insert(0, {"top": PH[j], "bot": PL[j], "bias": 1, "idx": j, "tag": tag, "brk": t})
             if il is not None and prev_il is not None and C[t] < il and C[t - 1] >= prev_il and not il_cr and il != sl_:
                 il_cr = True
+                tag = "CHOCH" if trend == 1 else "BOS"
+                trend = -1
                 seg = PH[il_idx:t]
                 if len(seg):
                     j = il_idx + int(np.argmax(seg))
-                    obs.insert(0, {"top": PH[j], "bot": PL[j], "bias": -1, "idx": j})
+                    obs.insert(0, {"top": PH[j], "bot": PL[j], "bias": -1, "idx": j, "tag": tag, "brk": t})
         # mitigasi
         obs = [o for o in obs if not ((o["bias"] == -1 and H[t] > max(o["top"], o["bot"])) or (o["bias"] == 1 and L[t] < min(o["top"], o["bot"])))]
         if len(obs) > 100:
@@ -3452,189 +3446,109 @@ def _lux_retest_zone(df: pd.DataFrame, direction: str, price: float):
     return best[2], best[3]
 
 
-def _htf_demand_long_check(pair: str, entry_tf: str):
+def _htf_demand_long_check(pair: str, entry_tf: str, df_react=None):
     """
-    Cek setup LONG di demand TF tinggi. Return (zone_lo, zone_hi, wick_low) atau None.
-    Zona = OB bullish gaya LuxAlgo (belum termitigasi) di 1D (mode 1) / 1W (mode 2) yang disentuh dalam
-    DZ_TOUCH_BARS candle entry TF terakhir, dan harga sekarang masih di atas dasar zona.
+    Setup LONG di demand kuat. Return (zone_lo, zone_hi, wick_low, atr_zona) atau None.
+    TF zona diambil berurutan dari DZ_TF_ORDER[HTF_DEMAND_MODE] (mis. 4h lalu 1h); zona pertama yang lolos dipakai.
+    Syarat zona: OB bullish gaya LuxAlgo belum termitigasi dan KUAT (reli sesudahnya >= DZ_MIN_DISP_ATR x ATR TF zona).
+    Syarat reaksi (dicek di candle 1h = df_react): (1) tersentuh dalam DZ_TOUCH_BARS candle terakhir dan harga masih di
+    atas dasar zona, (2) tak ada close di bawah dasar zona sejak sentuhan pertama, (3) ada reaksi buyer (close di atas
+    tengah zona sejak sentuhan, ATAU lower wick candle sentuhan terakhir >= body), (4) candle terakhir close bullish.
     """
     try:
         DZ_STATS["checks"] += 1
-        tf = "1w" if HTF_DEMAND_MODE == 2 else "1d"
-        df_z = fetch_ohlcv_safe(pair, tf, limit=300)
-        if df_z is None or len(df_z) < 40:
-            DZ_STATS["fetch_fail"] += 1
+        tfs = DZ_TF_ORDER.get(int(HTF_DEMAND_MODE), ["1h"])
+        df_r = df_react
+        if df_r is None:
+            df_r = fetch_ohlcv(pair, "1h", limit=250)
+        if df_r is None or len(df_r) < DZ_TOUCH_BARS + 5:
             return None
-        df_e = fetch_ohlcv(pair, entry_tf, limit=250)
-        if df_e is None or len(df_e) < DZ_TOUCH_BARS + 5:
-            return None
-        obs = [o for o in _lux_order_blocks(df_z, RZ_OB_SIZE) if o["bias"] == 1]
-        if not obs:
-            DZ_STATS["no_bull_ob"] += 1
-            return None
-        recent = df_e.iloc[-DZ_TOUCH_BARS:]
+        recent = df_r.iloc[-DZ_TOUCH_BARS:]
         lows = recent["low"].astype(float).values
         highs = recent["high"].astype(float).values
-        last_close = float(df_e["close"].iloc[-1])
-        for o in obs:   # terbaru dulu
-            z_lo, z_hi = min(o["top"], o["bot"]), max(o["top"], o["bot"])
-            touched = bool(((lows <= z_hi) & (highs >= z_lo)).any())
-            if touched and last_close > z_lo:
+        opens = recent["open"].astype(float).values
+        closes = recent["close"].astype(float).values
+        last_close = float(closes[-1])
+        any_fetch = False
+        for tf in tfs:
+            df_z = df_r if tf == "1h" else fetch_ohlcv_safe(pair, tf, limit=300)
+            if df_z is None or len(df_z) < 40:
+                continue
+            any_fetch = True
+            atr_z = calculate_atr(df_z)
+            if not atr_z or atr_z <= 0:
+                continue
+            Hz = df_z["high"].astype(float).values
+            obs = [ob for ob in _lux_order_blocks(df_z, RZ_OB_SIZE) if ob["bias"] == 1]
+            if not obs:
+                DZ_STATS["no_bull_ob"] += 1
+                continue
+            for ob in obs:   # terbaru dulu
+                z_lo, z_hi = min(ob["top"], ob["bot"]), max(ob["top"], ob["bot"])
+                if DZ_MIN_DISP_ATR > 0:
+                    disp = (float(Hz[ob["idx"] + 1:].max()) - z_lo) if ob["idx"] + 1 < len(Hz) else 0.0
+                    if disp < DZ_MIN_DISP_ATR * atr_z:
+                        DZ_STATS["weak"] += 1
+                        continue
+                idxs = [i for i in range(len(lows)) if lows[i] <= z_hi and highs[i] >= z_lo]
+                if not idxs or last_close <= z_lo:
+                    continue
                 DZ_STATS["touched"] += 1
-                return float(z_lo), float(z_hi), float(lows.min())
+                first, tc = idxs[0], idxs[-1]
+                if any(c < z_lo for c in closes[first:]):
+                    continue
+                DZ_STATS["held"] += 1
+                mid = (z_lo + z_hi) / 2.0
+                body = abs(closes[tc] - opens[tc])
+                lower_wick = min(opens[tc], closes[tc]) - lows[tc]
+                if not (any(c > mid for c in closes[first:]) or lower_wick >= max(body, 1e-12)):
+                    continue
+                DZ_STATS["reacted"] += 1
+                if not (closes[-1] > opens[-1]):
+                    continue
+                DZ_STATS["trigger"] += 1
+                return float(z_lo), float(z_hi), float(lows.min()), float(atr_z)
+        if not any_fetch:
+            DZ_STATS["fetch_fail"] += 1
         return None
     except Exception:
         return None
 
 
-def _demand_buyer_reaction(df: pd.DataFrame, z_lo: float, z_hi: float, atr: float) -> tuple:
-    """
-    Reaksi buyer di zona demand → (ok: bool, alasan: str). Hanya candle yang SUDAH close.
-    Syarat (semua harus ya):
-      1) candle close terakhir bullish (close > open)
-      2) harga terakhir masih di atas dasar zona
-      3) ada reaksi buyer sejak sentuhan pertama zona: ekor bawah panjang di candle yang masuk zona,
-         ATAU harga sudah naik >= DZ_REACTION_BOUNCE_ATR x ATR dari titik terendah.
-    Tidak butuh BOS / HH+HL.
-    """
+def _choch_demand_check(pair: str, df_h1):
+    """CHoCH bullish di 1h + demand (OB bullish yang lahir dari jebolan itu) di bawahnya.
+    Return (zone_lo, zone_hi, wick_low, atr_1h) atau None."""
     try:
-        rec = df.iloc[-DZ_TOUCH_BARS:]
-        o = [float(x) for x in rec["open"].values]
-        h = [float(x) for x in rec["high"].values]
-        lo = [float(x) for x in rec["low"].values]
-        c = [float(x) for x in rec["close"].values]
-        n = len(c)
-        if n < 2:
-            return False, "data kurang"
-        if not (c[-1] > o[-1]):
-            return False, "candle close terakhir belum bullish"
-        if not (c[-1] > z_lo):
-            return False, "harga di bawah dasar zona"
-        touched = [i for i in range(n) if lo[i] <= z_hi and h[i] >= z_lo]
-        if not touched:
-            return False, "tidak ada sentuhan zona"
-        fi = touched[0]
-        best_wick = 0.0
-        for i in touched:
-            rng = h[i] - lo[i]
-            if rng > 0 and c[i] > z_lo and (not atr or atr <= 0 or rng >= DZ_REACTION_MIN_RANGE_ATR * atr):
-                best_wick = max(best_wick, (min(o[i], c[i]) - lo[i]) / rng)
-        bounce = c[-1] - min(lo[fi:])
-        wick_ok = best_wick >= DZ_REACTION_WICK_MIN
-        bounce_ok = bool(atr and atr > 0 and bounce >= DZ_REACTION_BOUNCE_ATR * atr)
-        if not (wick_ok or bounce_ok):
-            return False, "belum ada reaksi buyer (ekor bawah pendek & belum mantul)"
-        why = []
-        if wick_ok:
-            why.append(f"ekor bawah {best_wick * 100:.0f}% di zona")
-        if bounce_ok:
-            why.append(f"mantul {bounce / atr:.1f}xATR dari low")
-        return True, "buyer bereaksi (" + ", ".join(why) + ") + candle close bullish"
-    except Exception as e:  # noqa: BLE001
-        return False, f"error {e}"
-
-
-def _htf_supply_short_check(pair: str, entry_tf: str):
-    """
-    Cek setup SHORT di supply TF tinggi. Return (zone_lo, zone_hi, wick_high) atau None.
-    Zona = OB bearish gaya LuxAlgo (zona merah, belum termitigasi) di TF sesuai HTF_SUPPLY_MODE yang disentuh
-    dalam DZ_TOUCH_BARS candle entry TF terakhir, dan harga sekarang masih di bawah atap zona.
-    """
-    try:
-        SZ_STATS["checks"] += 1
-        tf = SZ_TF_MAP.get(HTF_SUPPLY_MODE, "1h")
-        df_z = fetch_ohlcv_safe(pair, tf, limit=300)
-        if df_z is None or len(df_z) < 40:
-            SZ_STATS["fetch_fail"] += 1
+        if df_h1 is None or len(df_h1) < 60:
             return None
-        df_e = fetch_ohlcv(pair, entry_tf, limit=250)
-        if df_e is None or len(df_e) < DZ_TOUCH_BARS + 5:
+        atr = calculate_atr(df_h1)
+        if not atr or atr <= 0:
             return None
-        obs = [o for o in _lux_order_blocks(df_z, RZ_OB_SIZE) if o["bias"] == -1]
-        if not obs:
-            SZ_STATS["no_bear_ob"] += 1
-            return None
-        recent = df_e.iloc[-DZ_TOUCH_BARS:]
-        lows = recent["low"].astype(float).values
-        highs = recent["high"].astype(float).values
-        last_close = float(df_e["close"].iloc[-1])
-        for o in obs:   # terbaru dulu
-            z_lo, z_hi = min(o["top"], o["bot"]), max(o["top"], o["bot"])
-            touched = bool(((lows <= z_hi) & (highs >= z_lo)).any())
-            if touched and last_close < z_hi:
-                SZ_STATS["touched"] += 1
-                return float(z_lo), float(z_hi), float(highs.max())
+        H = df_h1["high"].astype(float).values
+        L = df_h1["low"].astype(float).values
+        C = df_h1["close"].astype(float).values
+        n = len(df_h1)
+        for ob in _lux_order_blocks(df_h1, RZ_OB_SIZE):
+            if ob["bias"] != 1 or ob.get("tag") != "CHOCH":
+                continue
+            if n - 1 - ob["brk"] > DZ_CHOCH_BARS:
+                continue
+            z_lo, z_hi = min(ob["top"], ob["bot"]), max(ob["top"], ob["bot"])
+            disp = (float(H[ob["idx"] + 1:].max()) - z_lo) if ob["idx"] + 1 < n else 0.0
+            if disp < DZ_CHOCH_MIN_DISP_ATR * atr or C[-1] <= z_lo:
+                continue
+            DZ_STATS["choch_found"] += 1
+            return float(z_lo), float(z_hi), float(L[ob["idx"]:].min()), float(atr)
         return None
     except Exception:
         return None
 
 
-def _supply_seller_reaction(df: pd.DataFrame, z_lo: float, z_hi: float, atr: float) -> tuple:
-    """
-    Reaksi seller di zona supply → (ok: bool, alasan: str). Hanya candle yang SUDAH close. Kembaran _demand_buyer_reaction.
-    Syarat (semua harus ya):
-      1) candle close terakhir bearish (close < open)
-      2) harga terakhir masih di bawah atap zona
-      3) ada reaksi seller sejak sentuhan pertama zona: ekor ATAS panjang di candle yang masuk zona,
-         ATAU harga sudah turun >= DZ_REACTION_BOUNCE_ATR x ATR dari titik tertinggi.
-    Tidak butuh BOS / LH+LL.
-    """
-    try:
-        rec = df.iloc[-DZ_TOUCH_BARS:]
-        o = [float(x) for x in rec["open"].values]
-        h = [float(x) for x in rec["high"].values]
-        lo = [float(x) for x in rec["low"].values]
-        c = [float(x) for x in rec["close"].values]
-        n = len(c)
-        if n < 2:
-            return False, "data kurang"
-        if not (c[-1] < o[-1]):
-            return False, "candle close terakhir belum bearish"
-        if not (c[-1] < z_hi):
-            return False, "harga di atas atap zona"
-        touched = [i for i in range(n) if lo[i] <= z_hi and h[i] >= z_lo]
-        if not touched:
-            return False, "tidak ada sentuhan zona"
-        fi = touched[0]
-        best_wick = 0.0
-        for i in touched:
-            rng = h[i] - lo[i]
-            if rng > 0 and c[i] < z_hi and (not atr or atr <= 0 or rng >= DZ_REACTION_MIN_RANGE_ATR * atr):
-                best_wick = max(best_wick, (h[i] - max(o[i], c[i])) / rng)
-        drop = max(h[fi:]) - c[-1]
-        wick_ok = best_wick >= DZ_REACTION_WICK_MIN
-        drop_ok = bool(atr and atr > 0 and drop >= DZ_REACTION_BOUNCE_ATR * atr)
-        if not (wick_ok or drop_ok):
-            return False, "belum ada reaksi seller (ekor atas pendek & belum turun)"
-        why = []
-        if wick_ok:
-            why.append(f"ekor atas {best_wick * 100:.0f}% di zona")
-        if drop_ok:
-            why.append(f"turun {drop / atr:.1f}xATR dari high")
-        return True, "seller bereaksi (" + ", ".join(why) + ") + candle close bearish"
-    except Exception as e:  # noqa: BLE001
-        return False, f"error {e}"
-
-
-def _sz_entry_sl_tp(price: float, z_hi: float, wick_high: float, atr: float) -> tuple:
-    """Entry SHORT di harga sekarang, SL di atas atap zona / wick tertinggi sentuhan + buffer."""
-    entry = price
-    sl = max(z_hi, wick_high) + RZ_SL_BUF_ATR * (atr or 0.0)
-    dist = sl - entry
-    tp1 = entry - dist * TP1_R_MULT
-    tp2 = entry - dist * (RR_GRADE_A + 0.5)
-    if dist <= 0:
-        return entry, sl, tp1, tp2, 0.0, 0.0
-    if SINGLE_TP_MODE:
-        tp1 = entry - dist * SINGLE_TP_R_MULT
-        tp2 = tp1
-    return entry, sl, tp1, tp2, round(abs(tp1 - entry) / dist, 2), round(abs(tp2 - entry) / dist, 2)
-
-
-def _dz_entry_sl_tp(price: float, z_lo: float, wick_low: float, atr: float) -> tuple:
-    """Entry LONG di harga sekarang, SL di bawah dasar zona / wick sentuhan terendah + buffer."""
-    entry = price
-    sl = min(z_lo, wick_low) - RZ_SL_BUF_ATR * (atr or 0.0)
+def _dz_entry_sl_tp(price: float, z_lo: float, z_hi: float, wick_low: float, atr_z: float) -> tuple:
+    """Entry LONG di ujung atas zona (atau harga sekarang kalau sudah di dalam zona), SL di bawah dasar zona / wick
+    sentuhan terendah dikurangi ruang DZ_SL_BUF_ATR x ATR TF zona."""
+    entry = min(z_hi, price)
+    sl = min(z_lo, wick_low) - DZ_SL_BUF_ATR * (atr_z or 0.0)
     dist = entry - sl
     tp1 = entry + dist * TP1_R_MULT
     tp2 = entry + dist * (RR_GRADE_A + 0.5)
@@ -6243,7 +6157,7 @@ TREND_GATE_DI_MIN     = 0.0    # skip kalau kekuatan DI gap HTF (searah trade) <
 # serta STRUCT_FILTER_LTF (kalau dinyalakan lewat token `sf1`) dan limit harian/mingguan/bulanan (kalau diberi token).
 # Nilai input tiap gate dicatat ke CSV (adx_htf, di_gap_htf, ema_gap_htf, atr_pct, htf_bias,
 # htf_struct_ok, htf_er, sl_source=OB/FVG/SWING) untuk dinilai belakangan.
-RESEARCH_MODE         = False   # v-retest: default MATI. Di backtest nyalakan lewat token `rs1` (jangan True di bot live)
+RESEARCH_MODE         = True    # PROFIL STABIL: gate lama dimatikan (data 1309 trade: gate lama tak menambah nilai, yang bekerja = regime searah). Matikan lewat token `rs0` di backtest atau ubah ke False.
 
 # ── ZONA RETEST HTF (v-retest 2026-11-17) ────────────────────────────────────────────────────
 # Entry di support yang jebol jadi resistance (SHORT) / resistance yang jebol jadi support (LONG) dari swing 1h:
@@ -6264,55 +6178,30 @@ HTF_RETEST_ZONE_SRC   = 1
 # Dari analisa 1309 trade (6 window): trade searah regime pasar (LONG di BULL_REGIME, SHORT di BEAR_REGIME) R +0.27,
 # MIXED +0.02. True = hanya entry kalau regime searah (BTC/ETH dikecualikan). Beda dengan EDGE_REGIME_GATE_ON
 # yang cuma memblok yang MELAWAN regime (hampir tak pernah terjadi). Di backtest: token `rg1`. Default MATI.
-REGIME_REQUIRE_ALIGNED = False
+REGIME_REQUIRE_ALIGNED = True    # PROFIL STABIL: LONG hanya di BULL_REGIME, SHORT hanya di BEAR_REGIME (berlaku untuk semua pair termasuk BTC/ETH). Matikan: token `rg0`.
 
-# ── LONG DI DEMAND TIMEFRAME TINGGI + REAKSI LTF (v-dz 2026-11-17) ───────────────────────────
-# Ide: LONG hanya saat harga baru menyentuh zona DEMAND (OB bullish gaya LuxAlgo, belum termitigasi) di 1D / 1W,
-# lalu menunggu REAKSI BUYER di entry TF. (2026-11-24: TIDAK lagi butuh BOS / HH+HL 30m. Cukup:
-#   (1) harga sempat masuk zona demand, (2) ada reaksi buyer, (3) candle 30m terakhir yang sudah close = bullish.)
-# SL di bawah dasar zona / wick terendah sentuhan (+ buffer RZ_SL_BUF_ATR x ATR), TP = SINGLE_TP_R_MULT.
-# Jalur ini MENGGANTIKAN gate arah HTF (ranging, ADX/DI, slow trend, struktur HTF, regime) karena ini setup reversal.
-# 0 = mati | 1 = demand 1D | 2 = demand 1W. Di backtest: token `dz1` / `dz2`. Default MATI.
+# ── LONG DI DEMAND + REAKSI BUYER (v-dz 2026-11-17) ───────────────────────────────────────────
+# Cara trader: cari DEMAND KUAT (OB bullish gaya LuxAlgo, belum termitigasi) di 4h; kalau tidak ada yang kuat pakai 1h.
+# Lalu "masuk ke 1h" buat detail: harga baru menyentuh zona, tidak ada close di bawah dasar zona, ada reaksi buyer
+# (close di atas tengah zona / lower wick >= body) dan candle 1h terakhir close bullish. TANPA syarat BOS/HH+HL & skor.
+# ENTRY = ujung atas zona (limit; kalau harga sudah di dalam zona dipakai harga sekarang),
+# SL = di bawah dasar zona / wick sentuhan terendah dikurangi RUANG (DZ_SL_BUF_ATR x ATR TF zona), TP = SINGLE_TP_R_MULT.
+# Jalur ini MENGGANTIKAN gate arah HTF (ranging, ADX/DI, slow trend, struktur, regime, sesi Asia).
+# Mode (token `dz<n>` di /backtest):  0 mati | 1 = 4h lalu 1h (default cara trader) | 2 = 4h saja | 3 = 1h saja | 4 = 1D | 5 = 1W
 HTF_DEMAND_MODE       = 0
-DZ_STATS = {"checks": 0, "fetch_fail": 0, "no_bull_ob": 0, "touched": 0, "after_bos": 0, "after_score": 0, "signals": 0}   # diagnosa (dibaca backtest)
-DZ_TOUCH_BARS         = 16      # sentuhan zona dihitung kalau terjadi dalam N candle entry TF terakhir (16 x 30m = 8 jam)
-# Reaksi buyer di demand (pengganti syarat BOS/HH+HL). Cukup SALAH SATU:
-#   - ada candle yang masuk zona dengan ekor bawah panjang (>= DZ_REACTION_WICK_MIN dari panjang candle) = buyer menolak harga turun
-#   - harga sudah naik >= DZ_REACTION_BOUNCE_ATR x ATR dari titik terendah sejak menyentuh zona
-DZ_REACTION_WICK_MIN   = 0.30
-DZ_REACTION_BOUNCE_ATR = 0.30
-DZ_REACTION_MIN_RANGE_ATR = 0.50   # candle yang dinilai ekornya harus cukup besar (>= 0.5 x ATR), biar candle mini tidak dihitung
-# True = sinyal demand tidak ditahan skor minimum (skor ikut sistem BOS lama, jadi cuma bikin sinyal demand kepotong).
-# Gate risiko lain (RR, volatilitas, cooldown, BTC/BTCD) TETAP jalan. False = skor minimum tetap berlaku.
-DZ_SKIP_SCORE_GATE     = True   # berlaku juga untuk SHORT di supply (HTF_SUPPLY_MODE)
-
-# ── SHORT DI SUPPLY (OB BEARISH gaya LuxAlgo = "zona merah") + REAKSI SELLER (2026-11-24) ────────────────
-# Kembaran mode demand tapi untuk SHORT: harga baru menyentuh zona SUPPLY (Order Block bearish internal LuxAlgo,
-# belum termitigasi = harga belum tembus atap zona), lalu ada REAKSI SELLER di entry TF dan candle close terakhir bearish.
-# Tanpa BOS / LH+LL. SL di atas atap zona / wick tertinggi sentuhan (+ buffer RZ_SL_BUF_ATR x ATR), TP = SINGLE_TP_R_MULT.
-# Jalur ini MENGGANTIKAN gate arah HTF seperti mode demand (setup reversal).
-# 0 = mati | 1 = zona dari chart 1H | 2 = zona 4H | 3 = zona 1D | 4 = zona 1W. Di backtest: token `sz1` .. `sz4`.
-HTF_SUPPLY_MODE       = 1       # DINYALAKAN 2026-11-24 (SHORT di zona merah 1H, dengan pengaman SZ_REQUIRE_*). Pakai bersama /maxopentrade 3. Ubah ke 0 untuk mematikan.
-SZ_TF_MAP             = {1: "1h", 2: "4h", 3: "1d", 4: "1w"}
-SZ_STATS = {"checks": 0, "fetch_fail": 0, "no_bear_ob": 0, "touched": 0, "after_bos": 0, "after_score": 0, "signals": 0,
-            "block_di": 0, "block_btc": 0, "block_chase": 0, "block_sl": 0}   # diagnosa (dibaca backtest)
-# PENGAMAN SHORT di supply (2026-11-24, dari backtest 30 hari 11 Okt-10 Nov 2024: 218 trade supply, WR 37%, -132 USDT).
-# Dua penyebab rugi terbesar: (1) SHORT saat BTC 15m sedang naik (58 trade, WR 15%, -195 USDT) dan
-# (2) SHORT padahal tren 1h (DI) melawan (89 trade yang sangat melawan, WR 24%, -208 USDT).
-# Dengan dua syarat ini di log yang sama: 96 trade, WR 56%, +172 USDT (IN-SAMPLE).
-# UJI PERIODE LAIN (2026-11-25, 17 Feb-17 May 2024, 14 pair): 188 trade, WR 41.0%, PF 0.98, -12 USDT.
-#   Entry acak (baseline rand2, n=40) di jendela sama: WR 35%, PF 0.76 -> belum bisa dibedakan dari acak.
-#   WR 56% -> 41% = tanda overfit. Jangan setel ulang angka di sini dari satu jendela; validasi di banyak jendela.
-# GUARD ENTRY (2026-11-25, hipotesis STRUKTURAL, BUKAN hasil tuning): syarat reaksi seller sangat longgar (ekor atas >= 30%
-# ATAU turun >= 0.3 ATR), jadi sinyal bisa muncul jauh setelah zona ditinggalkan: entry market mengejar harga, SL tetap
-# di atas high 8 jam terakhir -> SL lebar, zona tidak lagi berperan. Dua guard di bawah memaksa entry tetap dekat zona.
-# 0 = nonaktif (perilaku lama) untuk A/B test. Statistik: SZ_STATS["block_chase"] / ["block_sl"].
-SZ_MAX_CHASE_ATR      = 0.75    # skip kalau harga sudah > N x ATR(entry TF) DI BAWAH dasar zona (mengejar)
-SZ_MAX_SL_ATR         = 4.0     # skip kalau jarak SL > N x ATR(entry TF) (batas kewajaran, bukan hasil tuning)
-# Backtest: token `sg0` = pengaman mati (hasil seperti sebelumnya) | `sg1` = nyala. Tanpa token = ikut nilai di bawah.
-SZ_REQUIRE_BTC_NOT_UP = True    # SHORT di supply ditolak kalau BTC 15m sedang naik (BULLISH)
-SZ_REQUIRE_HTF_DI     = True    # SHORT di supply ditolak kalau tren 1h melawan (selisih DI < SZ_MIN_DI_GAP)
-SZ_MIN_DI_GAP         = 0.0     # 0 = tren 1h minimal tidak melawan SHORT; naikkan (mis. 5) kalau mau tren 1h turun jelas
+DZ_TF_ORDER           = {1: ["4h", "1h"], 2: ["4h"], 3: ["1h"], 4: ["1d"], 5: ["1w"]}
+DZ_MIN_DISP_ATR       = 3.0     # demand 'kuat' = reli setelah OB >= N x ATR TF zona (0 = tanpa filter). Token `zd<n>`
+DZ_SL_BUF_ATR         = 0.4     # ruang SL di bawah wick/dasar zona (x ATR TF zona). Token `zb<n>` (mis. zb0.4)
+# CHoCH + DEMAND (token `dc1`): setelah CHoCH bullish di 1h, OB bullish yang lahir dari jebolan itu = demand di bawah CHoCH.
+# Langsung entry di ujung atas zona itu (limit), tanpa menunggu reaksi/candle bullish — momentum biasanya kuat.
+# Syarat: CHoCH baru (<= DZ_CHOCH_BARS candle 1h), OB belum termitigasi, reli sesudah OB >= DZ_CHOCH_MIN_DISP_ATR x ATR 1h,
+# harga masih di atas dasar zona. Bisa jalan sendiri (tanpa `dz<n>`) atau bersama setup reaksi.
+DZ_CHOCH_ENTRY        = False
+DZ_MAX_ENTRY_DIST_PCT = 0.03    # batas jarak entry (ujung zona) ke harga untuk jalur demand: 3% (setup biasa 0.6%)
+DZ_CHOCH_BARS         = 24
+DZ_CHOCH_MIN_DISP_ATR = 2.0
+DZ_TOUCH_BARS         = 8       # sentuhan dihitung kalau terjadi dalam N candle 1h terakhir
+DZ_STATS = {"checks": 0, "fetch_fail": 0, "no_bull_ob": 0, "weak": 0, "choch_found": 0, "signals_choch": 0, "touched": 0, "held": 0, "reacted": 0, "trigger": 0, "signals": 0}   # diagnosa (dibaca backtest)
 RZ_OB_SIZE            = 5       # size struktur internal LuxAlgo
 # Pilih OB: 0 = terdekat dari harga | 1 = 'origin' = OB dengan pergerakan lanjutan terbesar sesudahnya (asal impuls). Token `zp0`/`zp1`.
 RZ_OB_PICK            = 1
@@ -15534,126 +15423,6 @@ def cmd_setscoreupto(parts: list):
     )
 
 
-def _pairs_norm(tok: str):
-    """BTC -> BTCUSDT, shib -> 1000SHIBUSDT (kalau ada di daftar bot)."""
-    t = tok.strip().upper().replace("/", "").replace("-", "").replace("_", "")
-    if not t:
-        return None
-    if not t.endswith("USDT"):
-        t += "USDT"
-    if t in BASE_PAIRS:
-        return t
-    alt = "1000" + t
-    return alt if alt in BASE_PAIRS else t
-
-
-def _pairs_parse(tokens: list):
-    """-> (pair valid urut sesuai BASE_PAIRS, token yang tidak dikenal)."""
-    raw = []
-    for a in tokens:
-        raw += [x for x in a.replace(",", " ").split() if x.strip()]
-    ok, bad = set(), []
-    for r in raw:
-        p = _pairs_norm(r)
-        if p in BASE_PAIRS:
-            ok.add(p)
-        else:
-            bad.append(r)
-    return [p for p in BASE_PAIRS if p in ok], bad
-
-
-def _pairs_status_text() -> str:
-    shown = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
-    total = len(BASE_PAIRS)
-    if _PAIR_SELECTION:
-        head = f"🎯 <b>TERPILIH</b> — {len(shown)} dari {total} pair"
-    else:
-        head = f"🌐 <b>SEMUA</b> — {total} pair"
-    names = ", ".join(p.replace("USDT", "") for p in shown)
-    try:
-        n_valid = len(get_active_pairs())
-    except Exception:
-        n_valid = len(shown)
-    return (
-        f"📡 <b>Pair yang Dipantau</b>\n"
-        f"{'─'*34}\n"
-        f"{head}\n"
-        f"{names}\n"
-        f"{'─'*34}\n"
-        f"✅ Dipindai di mode {BOT_MODE}: <b>{n_valid}</b> pair\n"
-        f"ℹ️ Berlaku mulai putaran scan berikutnya. Posisi yang sudah terbuka tetap dikelola sampai selesai."
-    )
-
-
-def cmd_pairs(parts: list):
-    """
-    /pairs                    → lihat pair yang dipantau sekarang
-    /pairs all                → pantau SEMUA pair
-    /pairs 15                 → 15 pair pertama di daftar bot
-    /pairs BTC,ETH,SOL        → hanya pair ini (nama pendek boleh: BTC, shib, pepe)
-    /pairs add DOGE,SUI       → tambah pair ke pilihan sekarang
-    /pairs remove DOGE        → keluarkan pair dari pilihan sekarang
-    Tanpa restart; tersimpan di bot_state.json.
-    """
-    global _PAIR_SELECTION
-    args = [a for a in parts[1:] if a.strip()]
-    usage = (
-        "\n\nCara pakai:\n"
-        "<code>/pairs all</code> → semua pair\n"
-        "<code>/pairs 15</code> → 15 pair pertama\n"
-        "<code>/pairs BTC,ETH,SOL</code> → hanya pair ini\n"
-        "<code>/pairs add DOGE</code> / <code>/pairs remove DOGE</code>"
-    )
-    if not args:
-        send_telegram_raw(_pairs_status_text() + usage)
-        return
-
-    first = args[0].lower()
-    total = len(BASE_PAIRS)
-
-    if first in ("all", "semua", "reset"):
-        new_sel = None
-    elif first.isdigit():
-        n = int(first)
-        if not (1 <= n <= total):
-            send_telegram_raw(f"⚠️ Jumlah pair harus antara <b>1</b> sampai <b>{total}</b>.")
-            return
-        new_sel = None if n == total else list(BASE_PAIRS)[:n]
-    elif first in ("add", "tambah", "remove", "hapus", "del"):
-        picked, bad = _pairs_parse(args[1:])
-        if bad or not picked:
-            send_telegram_raw(
-                "⚠️ Pair tidak dikenal: <b>" + (", ".join(bad) if bad else "(kosong)") + "</b>\n"
-                "Pair harus ada di daftar bot. Contoh: <code>/pairs add DOGE,SUI</code>"
-            )
-            return
-        cur = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
-        if first in ("add", "tambah"):
-            cur = [p for p in BASE_PAIRS if p in set(cur) | set(picked)]
-        else:
-            cur = [p for p in cur if p not in set(picked)]
-        if not cur:
-            send_telegram_raw("⚠️ Minimal harus ada <b>1 pair</b> yang dipantau.")
-            return
-        new_sel = None if len(cur) == total else cur
-    else:
-        picked, bad = _pairs_parse(args)
-        if bad or not picked:
-            send_telegram_raw(
-                "⚠️ Pair tidak dikenal: <b>" + (", ".join(bad) if bad else "(kosong)") + "</b>\n"
-                "Pair harus ada di daftar bot. Contoh: <code>/pairs BTC,ETH,SOL</code>"
-            )
-            return
-        new_sel = None if len(picked) == total else picked
-
-    old_txt = f"{len(_PAIR_SELECTION)} pair" if _PAIR_SELECTION else "semua pair"
-    _PAIR_SELECTION = new_sel
-    save_state()
-    new_txt = f"{len(new_sel)} pair" if new_sel else "semua pair"
-    print(f"⚙️ /pairs diubah: {old_txt} → {new_txt}")
-    send_telegram_raw(f"✅ <b>Pair Diubah</b>: {old_txt} → <b>{new_txt}</b>\n\n" + _pairs_status_text())
-
-
 def cmd_maxopentrade(parts: list):
     """
     /maxopentrade <jumlah>
@@ -16268,7 +16037,6 @@ def cmd_menu():
         [{"text": "📊 Recap", "callback_data": "/recap"}],
         [{"text": "🧹 Cleanup Orders", "callback_data": "/cleanuporders"},
          {"text": "🧹 Cleanup Duplicate", "callback_data": "/cleanupduplicate"}],
-        [{"text": "📡 Pairs", "callback_data": "/pairs"}],
         [{"text": "❓ Help", "callback_data": "/help"}],
     ]
     send_message_with_keyboard("🤖 <b>Menu Bot</b> — tap tombol di bawah:", keyboard)
@@ -16361,7 +16129,6 @@ def cmd_backtest(parts):
       /backtest               → 7 hari, 15 pair pertama
       /backtest 14 all        → 14 hari, semua pair
       /backtest 7 BTCUSDT,ETHUSDT
-      /backtest 30 live sz1   → pair SAMA dengan yang dipantau live (lihat /pairs)
       /backtest 30 15 2026-10-12   → 30 hari SEBELUM 12 Okt 2026 (UTC)
       /backtest 60 15 2026-10-11 rand2 → BASELINE ACAK (seed 2): entry acak tanpa sinyal SMC,
                                          exit/fee/risk sama. Pembanding "apakah sinyal bot punya edge?"
@@ -16374,9 +16141,6 @@ def cmd_backtest(parts):
       /backtest 60 15 2026-10-11 htf      → STRATEGI tren 4H + pullback 1H (htf.py); htfflip = kontrol coinflip
       /backtest 60 15 2026-10-11 sd       → STRATEGI demand/supply zone (sd.py); sdflip = kontrol coinflip
       /backtest 60 15 2026-10-11 randsmc  → acak dgn struktur exit mirip smc2 (TP1 1R, TP2 3R, SL 1.5xATR)
-      /backtest 30 15 dz1  → LONG di demand 1D + reaksi buyer (tanpa BOS) | dz2 = demand 1W
-      /backtest 30 15 sz1  → SHORT di supply (OB merah LuxAlgo) 1H + reaksi seller (tanpa BOS) | sz2=4H sz3=1D sz4=1W
-      /backtest 30 15 sz1 sg0 → sama, tapi pengaman SHORT (BTC naik / tren 1h melawan) DIMATIKAN, untuk pembanding
     /backtest status | stop | last
     Berjalan sebagai proses TERPISAH (backtest.py) — tidak menyentuh trade_log.json,
     bot_state.json, atau order Binance. Log tersimpan di <data_dir>/backtests/.
@@ -16432,8 +16196,6 @@ def cmd_backtest(parts):
             days = int(parts[1])
         if len(parts) > 2:
             pairs = parts[2]
-            if pairs.lower() == "live":
-                pairs = ",".join(get_active_pairs())   # pair yang sama dengan yang dipantau bot (/pairs)
         if len(parts) > 3:
             end = parts[3].strip()
             import re as _re
@@ -16443,7 +16205,7 @@ def cmd_backtest(parts):
             _tok = parts[4].strip().lower()
             # Token ke-5 boleh langsung opsi (sr1.2 / pb / dl5 / dw5 / mt3) tanpa
             # harus isi mode strategi — mode default (SMC bot) dipakai.
-            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz|sz|sg)\d+(?:\.\d+)?", _tok):
+            if _re.fullmatch(r"pb|flip|(?:sr|be)\d+(?:\.\d+)?|(?:dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz|zd|zb|dc)\d+(?:\.\d+)?", _tok):
                 parts = list(parts[:4]) + ["-"] + list(parts[4:])
                 _tok = "-"
             _m = _re.fullmatch(r"(rand|randsmc)(\d*)", _tok)
@@ -16514,17 +16276,17 @@ def cmd_backtest(parts):
                     extra_args += ["--ema-pullback", "gate"]
                     mode_label += " pb"
                     continue
-                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz|sz|sg)(\d+(?:\.\d+)?)", _x.strip().lower())
+                _lm = _re.fullmatch(r"(dl|dw|mt|wl|ml|mw|rk|sf|sb|rz|rs|zs|zp|rg|dz|zd|zb|dc)(\d+(?:\.\d+)?)", _x.strip().lower())
                 if not _lm:
                     raise ValueError("limit")
-                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick", "rg": "--regime-aligned", "dz": "--demand-long", "sz": "--supply-short", "sg": "--supply-guard"}[_lm.group(1)]
+                _flag = {"dl": "--daily-loss-pct", "dw": "--daily-win-pct", "mt": "--max-trades-day", "wl": "--weekly-loss-pct", "ml": "--monthly-loss-pct", "mw": "--monthly-win-pct", "rk": "--risk", "sf": "--struct-filter", "sb": "--sl-buffer", "rz": "--retest-zone", "rs": "--research", "zs": "--zone-src", "zp": "--zone-pick", "rg": "--regime-aligned", "dz": "--demand-long", "zd": "--dz-disp", "zb": "--dz-buf", "dc": "--choch-entry"}[_lm.group(1)]
                 _val = _lm.group(2)
                 if _lm.group(1) == "mt":
                     _val = str(int(float(_val)))
                 extra_args += [_flag, _val]
                 mode_label += f" {_lm.group(1)}{_lm.group(2)}"
     except ValueError:
-        send_telegram_raw("❌ Format: <code>/backtest [hari] [all|jumlah|BTCUSDT,ETHUSDT] [YYYY-MM-DD akhir periode] [rand|rand2|randsmc|smc2|smc2flip|smc2:h4|smc2:btc|smc2:adx|sd|sdflip|ob|obflip|htf|htfflip|fund|fundflip] [pb sr<R> dl<%> dw<%> mt<n> dz1 sz1 sg0]</code>")
+        send_telegram_raw("❌ Format: <code>/backtest [hari] [all|jumlah|BTCUSDT,ETHUSDT] [YYYY-MM-DD akhir periode] [rand|rand2|randsmc|smc2|smc2flip|smc2:h4|smc2:btc|smc2:adx|sd|sdflip|ob|obflip|htf|htfflip|fund|fundflip] [pb sr<R> dl<%> dw<%> mt<n>]</code>")
         return
     days = max(1, min(days, 90))   # 2026-11-17: 60 → 90 (batas backtest.py = 90)
     cmd = _backtest_build_cmd(days, pairs, out_dir, end, rand_seed, extra_args)
@@ -16641,8 +16403,6 @@ def handle_command(text: str):
         cmd_setmarginratio(parts)
     elif cmd == "/maxopentrade":
         cmd_maxopentrade(parts)
-    elif cmd == "/pairs":
-        cmd_pairs(parts)
     elif cmd in ("/setscoreupto", "/setscore"):
         cmd_setscoreupto(parts)
     elif cmd in ("/maxtradesperday", "/maxtradeperday", "/maxtradeday"):
@@ -16732,13 +16492,6 @@ def handle_command(text: str):
             "/maxopentrade &lt;jumlah&gt;\n"
             "  Ubah max posisi yang boleh dibuka bersamaan (1–20), contoh:\n"
             "  <code>/maxopentrade 3</code>\n\n"
-            "/pairs\n"
-            "  Atur pair yang dipantau bot, tanpa restart (berlaku di scan berikutnya):\n"
-            "  <code>/pairs</code> → lihat pair sekarang\n"
-            "  <code>/pairs all</code> → semua pair\n"
-            "  <code>/pairs 15</code> → 15 pair pertama\n"
-            "  <code>/pairs BTC,ETH,SOL</code> → hanya pair ini\n"
-            "  <code>/pairs add DOGE</code> / <code>/pairs remove DOGE</code>\n\n"
             "/maxtradesperday &lt;jumlah&gt;\n"
             "  Batas jumlah trade yang boleh DIBUKA per hari UTC (0 = tanpa batas).\n"
             "  Yang dihitung hanya order yang TERISI; reset otomatis UTC 00:00,\n"
@@ -17642,22 +17395,17 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     ranging_ctx = None
 
     # LONG di demand TF tinggi (opsional) — setup reversal, menggantikan gate arah HTF
-    _dz_long, _dz_zone, _dz_wick = False, None, None
-    _dz_why = ""
+    _dz_long, _dz_zone, _dz_wick, _dz_atr, _dz_src = False, None, None, None, ""
     if HTF_DEMAND_MODE:
-        _dz_res = _htf_demand_long_check(pair, entry_tf)
+        _dz_res = _htf_demand_long_check(pair, entry_tf, df_htf)
         if _dz_res is not None:
-            _dz_long, _dz_zone, _dz_wick = True, (_dz_res[0], _dz_res[1]), _dz_res[2]
+            _dz_long, _dz_zone, _dz_wick, _dz_atr, _dz_src = True, (_dz_res[0], _dz_res[1]), _dz_res[2], _dz_res[3], "REACT"
+    if not _dz_long and DZ_CHOCH_ENTRY:
+        _dz_res = _choch_demand_check(pair, df_htf)
+        if _dz_res is not None:
+            _dz_long, _dz_zone, _dz_wick, _dz_atr, _dz_src = True, (_dz_res[0], _dz_res[1]), _dz_res[2], _dz_res[3], "CHOCH"
 
-    # SHORT di supply TF tinggi (OB bearish LuxAlgo, opsional) — kembaran demand, juga menggantikan gate arah HTF
-    _sz_short, _sz_zone, _sz_wick = False, None, None
-    if HTF_SUPPLY_MODE and not _dz_long:
-        _sz_res = _htf_supply_short_check(pair, entry_tf)
-        if _sz_res is not None:
-            _sz_short, _sz_zone, _sz_wick = True, (_sz_res[0], _sz_res[1]), _sz_res[2]
-    _zone_rev = _dz_long or _sz_short   # setup reversal di zona HTF (LONG demand / SHORT supply): gate arah HTF dilewati
-
-    if BLOCK_HTF_RANGING and not RESEARCH_MODE and htf_bias == "RANGING" and not _zone_rev:
+    if BLOCK_HTF_RANGING and not RESEARCH_MODE and htf_bias == "RANGING" and not _dz_long:
         print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} RANGING (sideways), BLOCK_HTF_RANGING aktif, skip")
         return
 
@@ -17679,7 +17427,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
         ranging_ctx = evaluate_htf_ranging(df_htf, df_entry_pre, htf_event, pair, label)
 
-        if not ranging_ctx.allowed and not _zone_rev and not (RESEARCH_MODE and getattr(ranging_ctx, "direction", None)):
+        if not ranging_ctx.allowed and not _dz_long and not (RESEARCH_MODE and getattr(ranging_ctx, "direction", None)):
             print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} RANGING, LTF score {ranging_ctx.ltf_score} "
                   f"< gate {LTF_RANGING_SCORE_GATE} (tidak ada bias jelas), skip")
             return
@@ -17692,7 +17440,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
     # RELAXED tier (LOW_TF): pakai logika asli, skip ranging tanpa CHoCH
     if tier == "RELAXED":
-        if htf_bias == "RANGING" and htf_event != "CHoCH" and not _zone_rev:
+        if htf_bias == "RANGING" and htf_event != "CHoCH" and not _dz_long:
             print(f"  ⏭  [{label}] {pair} — HTF {htf_tf} ranging tanpa CHoCH, skip")
             return
         if htf_bias == "RANGING":
@@ -17704,9 +17452,6 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
     if _dz_long:
         trade_direction = "BULLISH"
-        htf_aligned     = False   # setup reversal: HTF 1h tidak dianggap searah
-    elif _sz_short:
-        trade_direction = "BEARISH"
         htf_aligned     = False   # setup reversal: HTF 1h tidak dianggap searah
 
     # ── SIGNAL COOLDOWN CHECK ──────────────────────────────────────────────────
@@ -17726,11 +17471,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     except Exception:
         adx_htf, pdi_htf, ndi_htf = 25.0, 0.0, 0.0
     di_gap_htf = (pdi_htf - ndi_htf) if trade_direction == "BULLISH" else (ndi_htf - pdi_htf)
-    if _sz_short and SZ_REQUIRE_HTF_DI and di_gap_htf < SZ_MIN_DI_GAP:
-        SZ_STATS["block_di"] += 1
-        print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: tren {htf_tf} melawan SHORT (DI gap {di_gap_htf:.1f} < {SZ_MIN_DI_GAP:g}), skip")
-        return
-    if TREND_GATE_ON and not RESEARCH_MODE and not _zone_rev:
+    if TREND_GATE_ON and not RESEARCH_MODE and not _dz_long:
         _dir_s = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if TREND_GATE_ADX_MIN > 0 and adx_htf < TREND_GATE_ADX_MIN:
             print(f"  ⛔ [{label}] {pair} {_dir_s} — TREND GATE: ADX {htf_tf} {adx_htf:.1f} "
@@ -17763,7 +17504,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 _slow_ok_data = True
     except Exception:
         ema_gap_htf, _slow_ok_data = 0.0, False
-    if SLOW_TREND_GATE_ON and not RESEARCH_MODE and not _zone_rev and _slow_ok_data and ema_gap_htf < 0:
+    if SLOW_TREND_GATE_ON and not RESEARCH_MODE and not _dz_long and _slow_ok_data and ema_gap_htf < 0:
         _dir_s2 = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_s2} — SLOW TREND GATE: EMA50 vs EMA200 {htf_tf} "
               f"berlawanan arah trade (gap {ema_gap_htf:+.2f}%), skip")
@@ -17779,7 +17520,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         _st_ok, _st_why, _st_info = check_htf_structure(df_htf, trade_direction, _atr_h)
         _hs_ok = int(bool(_st_ok))
         _hs_er = round(float(_st_info["er"]), 3) if _st_info.get("er") is not None else ""
-        if not _st_ok and not RESEARCH_MODE and not _zone_rev:
+        if not _st_ok and not RESEARCH_MODE and not _dz_long:
             _dir_s3 = "LONG" if trade_direction == "BULLISH" else "SHORT"
             print(f"  ⛔ [{label}] {pair} {_dir_s3} — HTF STRUCTURE GATE: {_st_why}, skip")
             return
@@ -17815,7 +17556,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     entry_atr_pct = (entry_atr / current_price * 100) if current_price > 0 else 0.0
 
     # ── EDGE FILTER (v77) — arah, volatilitas, pair ──
-    if EDGE_FILTER_ON and not RESEARCH_MODE and not _zone_rev:
+    if EDGE_FILTER_ON and not RESEARCH_MODE and not _dz_long:
         _edge_dir = "LONG" if trade_direction == "BULLISH" else "SHORT"
         if _edge_dir not in EDGE_ALLOWED_DIRS:
             print(f"  ⛔ [{label}] {pair} {_edge_dir} — EDGE FILTER: arah dimatikan, skip")
@@ -17863,7 +17604,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                 if _reg_blk:
                     print(f"  ⛔ [{label}] {pair} — EDGE FILTER: {_reg_why}, skip")
                     return
-            if REGIME_REQUIRE_ALIGNED and not _zone_rev and pair not in ALTCOIN_EXEMPTIONS:
+            if REGIME_REQUIRE_ALIGNED and not _dz_long:
                 _need_reg = "BULL_REGIME" if trade_direction == "BULLISH" else "BEAR_REGIME"
                 if _mkt_regime != _need_reg:
                     _dir_rg = "LONG" if trade_direction == "BULLISH" else "SHORT"
@@ -17871,7 +17612,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
                     return
         except Exception as _reg_err:
             print(f"  ⚠️ [{label}] {pair} — cek market regime gagal ({_reg_err}), dilewati")
-            if REGIME_REQUIRE_ALIGNED and not _zone_rev and pair not in ALTCOIN_EXEMPTIONS:
+            if REGIME_REQUIRE_ALIGNED and not _dz_long:
                 print(f"  ⛔ [{label}] {pair} — REGIME ALIGN: regime tidak diketahui, skip")
                 return
 
@@ -17972,10 +17713,6 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     if _dz_long:
         _rz_touch = True
         _rz_lo, _rz_hi = _dz_zone
-        in_ob, best_ob, in_fvg = False, None, False
-    elif _sz_short:
-        _rz_touch = True
-        _rz_lo, _rz_hi = _sz_zone
         in_ob, best_ob, in_fvg = False, None, False
 
     if HTF_RETEST_ZONE_MODE and not (in_ob or in_fvg or _rz_touch):
@@ -18096,11 +17833,6 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         print(f"  🚫 [{label}] {pair} {dir_str} — BTCD CORR BLOK: {corr_reason}")
         return
 
-    if _sz_short and SZ_REQUIRE_BTC_NOT_UP and btc_ltf_dir == "BULLISH":
-        SZ_STATS["block_btc"] += 1
-        print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: BTC {BTC_LTF_TF} sedang naik, skip")
-        return
-
     # corr_score dimasukkan ke macro_pts sebagai bonus/penalty tambahan
     m_pts = m_pts + corr_score
     if corr_score != 0:
@@ -18148,31 +17880,16 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         fvg     if in_fvg else None,
     )
     if _dz_long:
-        entry, sl, tp1, tp2, rr1, rr2 = _dz_entry_sl_tp(price, _rz_lo, _dz_wick, entry_atr)
-    elif _sz_short:
-        entry, sl, tp1, tp2, rr1, rr2 = _sz_entry_sl_tp(price, _rz_hi, _sz_wick, entry_atr)
-        # GUARD (2026-11-25): entry harus dekat zona supply & SL tidak absurd lebar. Lihat komentar SZ_MAX_CHASE_ATR.
-        if entry_atr and entry_atr > 0:
-            _sz_chase = max(0.0, _rz_lo - price) / entry_atr
-            _sz_sl_atr = (sl - entry) / entry_atr
-            if SZ_MAX_CHASE_ATR > 0 and _sz_chase > SZ_MAX_CHASE_ATR:
-                SZ_STATS["block_chase"] += 1
-                print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: harga sudah {_sz_chase:.2f} ATR di bawah zona "
-                      f"(> {SZ_MAX_CHASE_ATR:g}, mengejar), skip")
-                return
-            if SZ_MAX_SL_ATR > 0 and _sz_sl_atr > SZ_MAX_SL_ATR:
-                SZ_STATS["block_sl"] += 1
-                print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: SL {_sz_sl_atr:.1f} ATR "
-                      f"(> {SZ_MAX_SL_ATR:g}, terlalu lebar), skip")
-                return
+        entry, sl, tp1, tp2, rr1, rr2 = _dz_entry_sl_tp(price, _rz_lo, _rz_hi, _dz_wick, _dz_atr)
     elif _rz_touch:
         entry, sl, tp1, tp2, rr1, rr2 = _rz_entry_sl_tp(trade_direction, price, _rz_lo, _rz_hi, entry_atr)
 
     if MAX_ENTRY_DISTANCE_ENABLED and price > 0:
         _dist_pct = abs(entry - price) / price
-        if _dist_pct > MAX_ENTRY_DISTANCE_PCT:
+        _max_d = DZ_MAX_ENTRY_DIST_PCT if _dz_long else MAX_ENTRY_DISTANCE_PCT
+        if _dist_pct > _max_d:
             print(f"  ⛔ [{label}] {pair} — entry {_dist_pct*100:.2f}% dari harga "
-                  f"> {MAX_ENTRY_DISTANCE_PCT*100:.1f}% (kejauhan), skip")
+                  f"> {_max_d*100:.1f}% (kejauhan), skip")
             return
 
     grade = grade_signal(rr1)
@@ -18195,7 +17912,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     # FIX (2026-08-31, 1:1 PORT dari base): reject sinyal BULLISH saat sesi
     # Asia — backtest nemu kombinasi ini WR 21.3% (-14.85R, n=47), jauh di
     # bawah rata-rata.
-    if trade_direction == "BULLISH" and session == "Asia" and not RESEARCH_MODE:
+    if trade_direction == "BULLISH" and session == "Asia" and not RESEARCH_MODE and not _dz_long:
         print(f"  ⛔ [{label}] {pair} — BULLISH di sesi Asia (ditolak, historis WR 21.3%)")
         return
 
@@ -18209,33 +17926,18 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     if tier == "RELAXED" and trade_direction == "BEARISH":
         effective_score = score - SHORT_SCORE_PENALTY_RELAXED
 
-    if STRUCT_FILTER_LTF and not _zone_rev:
+    if STRUCT_FILTER_LTF:
         _sf_ok, _sf_why = _ltf_structure_ok(df_entry, trade_direction)
         if not _sf_ok:
             _dir_sf = "LONG" if trade_direction == "BULLISH" else "SHORT"
             print(f"  ⛔ [{label}] {pair} {_dir_sf} — STRUCTURE FILTER: {_sf_why}, skip")
             return
 
-    if _dz_long:
-        # MODE DEMAND: tidak pakai BOS/HH+HL. Cukup reaksi buyer + candle close bullish.
-        _dz_ok, _dz_why = _demand_buyer_reaction(df_entry, _rz_lo, _rz_hi, entry_atr)
-        if not _dz_ok:
-            print(f"  ⛔ [{label}] {pair} LONG — DEMAND: {_dz_why}, skip")
-            return
-        DZ_STATS["after_bos"] += 1   # nama key dipertahankan (dibaca backtest) = lolos reaksi buyer
-    elif _sz_short:
-        # MODE SUPPLY: tidak pakai BOS/LH+LL. Cukup reaksi seller + candle close bearish.
-        _dz_ok, _dz_why = _supply_seller_reaction(df_entry, _rz_lo, _rz_hi, entry_atr)
-        if not _dz_ok:
-            print(f"  ⛔ [{label}] {pair} SHORT — SUPPLY: {_dz_why}, skip")
-            return
-        SZ_STATS["after_bos"] += 1   # = lolos reaksi seller
-    elif BOS_NONE_HARD_GATE and not bos_confirmed and not _rz_touch:
+    if BOS_NONE_HARD_GATE and not bos_confirmed and not _rz_touch:
         _dir_b = "LONG" if trade_direction == "BULLISH" else "SHORT"
         print(f"  ⛔ [{label}] {pair} {_dir_b} — BOS NONE di {entry_tf} (hard gate, skip)")
         return
-
-    if effective_score < effective_gate and not (_zone_rev and DZ_SKIP_SCORE_GATE):
+    if effective_score < effective_gate and not _dz_long:
         print(
             f"  📉 [{label}] {pair} — Score {score}"
             f"{f' (eff {effective_score} setelah SHORT penalty)' if effective_score != score else ''}"
@@ -18261,11 +17963,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         reasons.append(f"Ref TF ({mode.get('ref_tf')}) bias: {ref_bias} {'✅' if ref_aligned else '⚠️'}")
     reasons.append(f"EMA: {ema_reason}")
 
-    if _dz_long:
-        reasons.append(f"✅ Demand {'1W' if HTF_DEMAND_MODE == 2 else '1D'}: {_dz_why}")
-    elif _sz_short:
-        reasons.append(f"✅ Supply {SZ_TF_MAP.get(HTF_SUPPLY_MODE, '?').upper()} (OB bearish): {_dz_why}")
-    elif bos_confirmed:
+    if bos_confirmed:
         reasons.append(f"BOS {trade_direction} terkonfirmasi ({bos_str_label}) pada {entry_tf}")
         if eng_reason and eng_ok:
             reasons.append(f"✅ {eng_reason}")
@@ -18346,7 +18044,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         "_stoch_weak":     stoch_weak_tag,
         "_stoch_note":     stoch_note,
         "_sweep_strength": sweep_strength or "NONE",
-        "_sl_source":      ("DEMAND" if _dz_long else ("SUPPLY" if _sz_short else ("HTFZ" if _rz_touch else ("OB" if in_ob else ("FVG" if in_fvg else "SWING"))))),
+        "_sl_source":      (("DEMAND_CHOCH" if _dz_src == "CHOCH" else "DEMAND") if _dz_long else ("HTFZ" if _rz_touch else ("OB" if in_ob else ("FVG" if in_fvg else "SWING")))),
         "_rsi_entry":      round(rsi, 2),
         "_btc_ltf_dir":    btc_ltf_dir,
         "_btcd_ltf_dir":   btcd_ltf_dir,
@@ -18379,8 +18077,8 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
 
     if _dz_long:
         DZ_STATS["signals"] += 1
-    if _sz_short:
-        SZ_STATS["signals"] += 1
+        if _dz_src == "CHOCH":
+            DZ_STATS["signals_choch"] += 1
     signal_candidates.append({
         "pair":         pair,
         "direction":    trade_direction,
@@ -18428,7 +18126,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
         "stoch_weak":     stoch_weak_tag,
         "stoch_note":     stoch_note,
         "sweep_strength": sweep_strength or "NONE",
-        "sl_source":      ("DEMAND" if _dz_long else ("SUPPLY" if _sz_short else ("HTFZ" if _rz_touch else ("OB" if in_ob else ("FVG" if in_fvg else "SWING"))))),
+        "sl_source":      (("DEMAND_CHOCH" if _dz_src == "CHOCH" else "DEMAND") if _dz_long else ("HTFZ" if _rz_touch else ("OB" if in_ob else ("FVG" if in_fvg else "SWING")))),
         "btc_bias":       btc_bias,
         "btcd_trend":     btcd_trend,
         "btc_ltf_dir":    btc_ltf_dir,
@@ -18442,7 +18140,7 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     })
 
     tier_label = f"{tier}{'(RANGING)' if ranging_ctx else ''}"
-    bos_tag    = "DEMAND:✅" if _dz_long else ("SUPPLY:✅" if _sz_short else (f"BOS:{bos_str_label}" if bos_confirmed else "BOS:❌"))
+    bos_tag    = f"BOS:{bos_str_label}" if bos_confirmed else "BOS:❌"
     liq_tag    = f"Liq:{'✅' if liq_swept else '❌'}"
     zone_tag   = "Zone:OB+FVG" if (in_ob and in_fvg) else ("Zone:OB" if in_ob else ("Zone:FVG" if in_fvg else "Zone:❌"))
     corr_em    = "✅" if corr_score >= 0 else "⚠️"
@@ -18693,7 +18391,7 @@ def main():
     print(f"⚡ Leverage    : Auto-tier (5x-20x by price) | Max Trades: {MAX_OPEN_TRADES} (dynamic, scale otomatis)")
     print(f"🚀 Scan Config : interval={SCAN_INTERVAL}s | workers={MAX_WORKERS}  ← VERIFIKASI VERSI DEPLOY DI SINI")
     print()
-    print("TELEGRAM COMMANDS: /start /pnl /status /resumeorpause /closeallposition /changeliveordemo /setmarginratio /maxopentrade /maxtradesperday /pairs /resetpnl /cleanuporders /help")
+    print("TELEGRAM COMMANDS: /start /pnl /status /resumeorpause /closeallposition /changeliveordemo /setmarginratio /maxopentrade /maxtradesperday /resetpnl /cleanuporders /help")
     print("=" * 70)
 
     # Kirim IP publik ke Telegram + countdown 30 detik untuk whitelist
@@ -18769,7 +18467,6 @@ def main():
         f"  /changeliveordemo — ganti LIVE/DEMO (saat ini: <b>{mode_em}</b>)\n"
         f"  /setmarginratio — set max SL loss % per trade\n"
         f"  /maxopentrade — ubah max posisi\n"
-        f"  /pairs — atur pair yang dipantau\n"
         f"  /maxtradesperday — batas trade per hari\n"
         f"{'─'*38}\n"
         f"Ketik <b>/start</b> untuk konek ke Binance & mulai trading.\n"
