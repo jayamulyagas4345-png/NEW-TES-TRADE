@@ -3571,7 +3571,8 @@ def _htf_supply_short_check(pair: str, entry_tf: str):
             touched = bool(((lows <= z_hi) & (highs >= z_lo)).any())
             if touched and last_close < z_hi:
                 SZ_STATS["touched"] += 1
-                return float(z_lo), float(z_hi), float(highs.max())
+                _wb = SZ_SL_WICK_BARS if 0 < SZ_SL_WICK_BARS < len(highs) else len(highs)
+                return float(z_lo), float(z_hi), float(highs[-_wb:].max())
         return None
     except Exception:
         return None
@@ -3625,8 +3626,14 @@ def _supply_seller_reaction(df: pd.DataFrame, z_lo: float, z_hi: float, atr: flo
 
 
 def _sz_entry_sl_tp(price: float, z_hi: float, wick_high: float, atr: float) -> tuple:
-    """Entry SHORT di harga sekarang, SL di atas atap zona / wick tertinggi sentuhan + buffer."""
+    """Entry SHORT (MARKET = harga sekarang | PULLBACK = limit sedikit di atas harga, maks atap zona),
+    SL di atas atap zona / wick tertinggi + buffer."""
     entry = price
+    if SZ_ENTRY_MODE == "PULLBACK" and atr and atr > 0:
+        _off = SZ_PULLBACK_ATR * atr
+        if MAX_ENTRY_DISTANCE_ENABLED and price > 0:
+            _off = min(_off, 0.9 * MAX_ENTRY_DISTANCE_PCT * price)
+        entry = max(price, min(price + _off, z_hi))
     sl = max(z_hi, wick_high) + RZ_SL_BUF_ATR * (atr or 0.0)
     dist = sl - entry
     tp1 = entry - dist * TP1_R_MULT
@@ -6312,6 +6319,12 @@ SZ_STATS = {"checks": 0, "fetch_fail": 0, "no_bear_ob": 0, "touched": 0, "after_
 SZ_REQUIRE_BTC_NOT_UP = True    # SHORT di supply ditolak kalau BTC 15m sedang naik (BULLISH)
 SZ_REQUIRE_HTF_DI     = True    # SHORT di supply ditolak kalau tren 1h melawan (selisih DI < SZ_MIN_DI_GAP)
 SZ_MIN_DI_GAP         = 0.0     # 0 = tren 1h minimal tidak melawan SHORT; naikkan (mis. 5) kalau mau tren 1h turun jelas
+# ENTRY/SL SUPPLY (2026-11-27) — hasil audit backtest Feb 2024 & Agu-Sep 2026: entry di harga pasar setelah harga sudah turun +
+# SL di wick tertinggi 16 candle => SL median ~2.5% (3.5x ATR), TP 1.5R ~3.7% jauh, WR tanpa BE 25% / 42% (break-even ~41.6%).
+# BELUM DIUJI — backtest A/B dulu. Kembalikan perilaku lama: SZ_ENTRY_MODE = "MARKET", SZ_SL_WICK_BARS = 16 (token/BOT_OVERRIDES).
+SZ_ENTRY_MODE         = "PULLBACK"  # "MARKET" = entry di harga sekarang (lama) | "PULLBACK" = LIMIT jual SZ_PULLBACK_ATR x ATR di atas harga, maks sampai atap zona
+SZ_PULLBACK_ATR       = 0.5         # jarak limit di atas harga (x ATR entry TF); juga dibatasi 90% MAX_ENTRY_DISTANCE_PCT
+SZ_SL_WICK_BARS       = 6           # SL di atas high N candle entry-TF terakhir (bukan 16 = DZ_TOUCH_BARS); 0/16 = perilaku lama
 RZ_OB_SIZE            = 5       # size struktur internal LuxAlgo
 # Pilih OB: 0 = terdekat dari harga | 1 = 'origin' = OB dengan pergerakan lanjutan terbesar sesudahnya (asal impuls). Token `zp0`/`zp1`.
 RZ_OB_PICK            = 1
