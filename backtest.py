@@ -952,11 +952,52 @@ def scan_smc2(pairs, modes, now_dt):
 # ═════════════════════════════════════════════════════════════════════════════
 #  RINGKASAN
 # ═════════════════════════════════════════════════════════════════════════════
+EVAL_MARK = "EVALUASI BACKTEST (otomatis, sama dengan /evaluasi di bot)"
+
+
+def _strip_html(t: str) -> str:
+    import re as _re
+    t = _re.sub(r"<[^>]+>", "", t)
+    return t.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+
+
+def _backtest_eval_text(rows, args) -> str:
+    """Evaluasi hasil backtest dengan fungsi yang sama seperti /evaluasi di bot (main_demand.py v81 ke atas)."""
+    if not rows:
+        return ""
+    if not hasattr(bot, "_ev_summary_text"):
+        return (f"{EVAL_MARK}\n(tidak tersedia: butuh main_demand.py versi v81-evaluasi atau lebih baru)")
+    try:
+        bot.MAX_OPEN_TRADES = int(args.max_open)     # supaya saran Max open sesuai setelan backtest ini
+    except Exception:
+        pass
+    log = list(rows)                                  # urut waktu tutup
+    out = [EVAL_MARK, "=" * 60]
+    out.append(_strip_html(bot._ev_summary_text(log, log)).replace("TRADE TERAKHIR", "TRADE (SEMUA DI BACKTEST INI)"))
+    best_len = best_end = run = 0
+    for i, t in enumerate(log):
+        if bot._ev_is_loss(t):
+            run += 1
+            if run > best_len:
+                best_len, best_end = run, i
+        else:
+            run = 0
+    out.append("")
+    if best_len >= 3:
+        sub = log[: best_end + 1]
+        out.append("RUGI BERUNTUN TERPANJANG:")
+        out.append(_strip_html(bot._ev_streak_text(bot._ev_tail_streak(sub), sub, auto=False)))
+    else:
+        out.append("RUGI BERUNTUN TERPANJANG: kurang dari 3x, tidak ada yang perlu dievaluasi.")
+    return "\n".join(out)
+
+
 def summarize(rows, args, pairs, steps, n_open_end, errs):
     L = []
     ver = bot._bot_version_fields()
     L.append(f"📊 BACKTEST {args.run_id}")
     L.append(f"Versi bot : {ver['bot_version']} (upload {ver['build_date']})")
+    L.append(f"Diedit    : {ver.get('last_edit') or '-'} oleh {ver.get('edited_by') or '-'}   [git {ver.get('git_sha') or '-'}]")
     L.append(f"Periode   : {args.start_str} → {args.end_str} ({args.days} hari)")
     L.append(f"Pair      : {len(pairs)} | Scan tiap {args.scan_every} menit | Max open {args.max_open}")
     L.append(f"Limit hari: loss {args.daily_loss_pct:g}% | win {args.daily_win_pct:g}% | max trade/hari {args.max_trades_day} (0 = off)")
@@ -1317,6 +1358,12 @@ def main():
                  "  tidak ada OB bearish     : %d\n  zona kesentuh + di bawah : %d\n  ditolak: tren 1h melawan : %d\n  ditolak: BTC 15m naik    : %d\n"
                  "  lolos reaksi seller+bear : %d\n  jadi sinyal              : %d"
                  % (bot.HTF_SUPPLY_MODE, _s.get("checks", 0), _s.get("fetch_fail", 0), _s.get("no_bear_ob", 0), _s.get("touched", 0), _s.get("block_di", 0), _s.get("block_btc", 0), _s.get("after_bos", 0), _s.get("signals", 0)))
+    try:
+        _ev = _backtest_eval_text(SIM.rows, args)
+        if _ev:
+            text += "\n\n" + _ev
+    except Exception as _e:
+        text += f"\n\n(Evaluasi otomatis gagal: {_e})"
     bot.analyze_pair = _orig_ap
     single = bool(SINGLE_FILE) and not args.tag     # run dari Telegram (--tag tg) tetap 3 file
     if single:
