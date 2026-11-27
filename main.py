@@ -15,6 +15,7 @@
 ║    • /status     — status bot & posisi aktif                             ║
 ║    • /closeallposition — tutup semua posisi sekarang                     ║
 ║    • /maxopentrade <n> — set max posisi bersamaan                        ║
+║    • /pairs [all|N|BTC,ETH] — atur pair yang dipantau (bawaan: semua)    ║
 ║    • /maxtradesperday <n> — batas trade dibuka per hari (UTC, 0=off)      ║
 ║    • /setmarginratio <persen> — max loss % per trade jika SL kena         ║
 ║    • /resumeorpause, /start, /resetpnl, /help (kontrol dasar)             ║
@@ -208,6 +209,9 @@ def _serialize_state() -> dict:
         "DAILY_LOSS_LIMIT_PCT":      DAILY_LOSS_LIMIT_PCT,
         "DAILY_WIN_LIMIT_PCT":       DAILY_WIN_LIMIT_PCT,
         "MAX_TRADES_PER_DAY":        MAX_TRADES_PER_DAY,
+        "_PAIR_SELECTION":           (list(_PAIR_SELECTION) if _PAIR_SELECTION else None),
+        "EVAL_ENABLED":              EVAL_ENABLED,
+        "EVAL_STREAK_TRIGGER":       EVAL_STREAK_TRIGGER,
         "_trades_today_state":       dict(_trades_today_state),
         "bot_state":                 bs,
         "_daily_limit_state":        dls,
@@ -247,6 +251,7 @@ def load_state():
     global _user_set_max_trades, bot_paused, MIN_SCORE_CUSTOM, MIN_SCORE_RELAXED_CUSTOM
     global BTC_CORR_FILTER_ON, _ACTIVE_MODE_FILTER, _DIRECTION_FILTER, TP1_PARTIAL
     global STOCH_POSITION_GATE_ENABLED
+    global _PAIR_SELECTION, EVAL_ENABLED, EVAL_STREAK_TRIGGER
     global DAILY_LOSS_LIMIT_PCT, DAILY_WIN_LIMIT_PCT
     global MAX_TRADES_PER_DAY, _trades_today_state
     global bot_state, _daily_limit_state, _sent_signal_hashes, _cooldown_map
@@ -281,6 +286,16 @@ def load_state():
         # toggle). Kalau False, btcd_trend dipaksa "FLAT" -> macro_pts 0 -> skor beda.
         BTC_CORR_FILTER_ON       = True
         STOCH_POSITION_GATE_ENABLED = data.get("STOCH_POSITION_GATE_ENABLED", STOCH_POSITION_GATE_ENABLED)
+        _ps = data.get("_PAIR_SELECTION")
+        if isinstance(_ps, list):
+            _ps = [p for p in _ps if p in BASE_PAIRS]
+            _PAIR_SELECTION = _ps or None
+        EVAL_ENABLED = bool(data.get("EVAL_ENABLED", EVAL_ENABLED))
+        try:
+            _et = int(data.get("EVAL_STREAK_TRIGGER", EVAL_STREAK_TRIGGER))
+            EVAL_STREAK_TRIGGER = _et if 2 <= _et <= 10 else EVAL_STREAK_TRIGGER
+        except Exception:
+            pass
         # 1:1 DENGAN BASE: filter mode/arah/super-scalper TIDAK di-restore dari
         # state lama — dikunci ke default ("ALL"/"ALL"/False) supaya tidak ada
         # filter tersembunyi yang mengubah sinyal.
@@ -971,12 +986,16 @@ BASE_PAIRS = [
     "HYPEUSDT",
 ]
 
+# Pair yang dipantau bot, diatur lewat command /pairs (tersimpan di bot_state.json).
+# None = semua BASE_PAIRS | list = hanya pair itu (selalu bagian dari BASE_PAIRS).
+_PAIR_SELECTION = None
+
 def get_active_pairs() -> list:
-    """Pair aktif = BASE_PAIRS (1:1 dengan base signal-only).
+    """Pair aktif = BASE_PAIRS (1:1 dengan base signal-only), atau pilihan /pairs kalau diatur.
     Difilter ke symbol yang valid di exchange aktif (testnet punya daftar
     lebih sempit) — filter ini hanya membuang pair yang MEMANG tidak bisa
     di-trade di exchange itu, tidak mengubah logika sinyal."""
-    base = list(BASE_PAIRS)
+    base = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
     if not _exchange_info_cache:
         return base
     filtered = [p for p in base if p in _exchange_info_cache]
@@ -13618,10 +13637,12 @@ def _save_trade_log(log: list):
 
 # ══════════════════════════════════════════════════════════════════════════
 #  VERSION STAMP — dicocokkan dengan Railway & GitHub
-#  EDIT 3 BARIS INI SETIAP KALI UPLOAD VERSI BARU:
+#  EDIT 5 BARIS INI SETIAP KALI FILE DIUBAH (Claude juga wajib mengisinya tiap mengedit):
 # ══════════════════════════════════════════════════════════════════════════
-BOT_VERSION    = "v79-entry-fix"     # versi bot (ubah tiap rilis)
-BUILD_DATE     = "2026-11-17"             # tanggal upload ke GitHub (YYYY-MM-DD)
+BOT_VERSION    = "v85-petunjuk-backtest"     # versi bot (ubah tiap rilis)
+BUILD_DATE     = "2026-11-26"             # tanggal upload ke GitHub (YYYY-MM-DD)
+LAST_EDIT      = "2026-11-26 18:44 WIB"   # tanggal & jam edit TERAKHIR file ini (WIB = UTC+7)
+EDITED_BY      = "Claude - email akun: BELUM_DIISI"   # akun Claude (email) yang mengedit terakhir
 GITHUB_ACCOUNT = "ISI_AKUN_GITHUB_KAMU"   # cadangan manual jika Railway tidak mengisi owner repo
 # Sisanya otomatis dari env Railway (terisi jika deploy via integrasi GitHub).
 
@@ -13635,6 +13656,8 @@ def _bot_version_fields() -> dict:
     return {
         "bot_version":       BOT_VERSION,
         "build_date":        BUILD_DATE,
+        "last_edit":         LAST_EDIT,
+        "edited_by":         EDITED_BY,
         "git_sha":           _vs_env("RAILWAY_GIT_COMMIT_SHA")[:7],
         "git_branch":        _vs_env("RAILWAY_GIT_BRANCH"),
         "github_account":    _vs_env("RAILWAY_GIT_REPO_OWNER", GITHUB_ACCOUNT),
@@ -13650,6 +13673,7 @@ def _bot_version_line_html() -> str:
     repo = f"{v['github_account']}/{v['github_repo']}" if v["github_repo"] else v["github_account"]
     return (
         f"🏷 Versi : <b>{v['bot_version']}</b> | upload {v['build_date']}\n"
+        f"✏️ Diedit: {v['last_edit']} oleh {v['edited_by']}\n"
         f"🐙 GitHub: <code>{repo}</code> "
         f"({v['git_branch'] or '-'} @ {v['git_sha'] or '-'})\n"
         f"🚆 Railway: {v['railway_env'] or '-'} / deploy {v['railway_deploy_id'] or '-'}\n"
@@ -13837,6 +13861,427 @@ def record_trade_close(
         _save_trade_log(log)
 
     print(f"  📝 Trade logged: {symbol} {direction} {close_type} PnL={pnl_usdt:+.2f}")
+    try:
+        if EVAL_ENABLED and pnl_usdt <= 0:
+            threading.Thread(target=_eval_after_trade, daemon=True).start()
+    except Exception as _e:
+        print(f"⚠️ [evaluasi] thread gagal: {_e}")
+
+
+# ══════════════════════════════════════════════════════════════════════════
+#  EVALUASI OTOMATIS — "kenapa rugi beruntun?" (2026-11-25)
+#  Dikirim ke Telegram saat rugi beruntun mencapai EVAL_STREAK_TRIGGER (lalu tiap +EVAL_STREAK_STEP),
+#  atau manual lewat /evaluasi. HANYA MELAPOR: tidak mengubah setelan dan tidak menghentikan bot.
+#  Alasan: di simulasi 4 periode backtest, jeda otomatis setelah rugi beruntun justru menurunkan
+#  total hasil (kemenangan sering muncul tepat setelah rangkaian rugi).
+# ══════════════════════════════════════════════════════════════════════════
+EVAL_ENABLED        = True    # /evaluasi on | off
+EVAL_STREAK_TRIGGER = 3       # kirim evaluasi otomatis saat rugi beruntun mencapai angka ini (/evaluasi trigger N)
+EVAL_STREAK_STEP    = 2       # lalu kirim lagi tiap +N (3, 5, 7, ...)
+EVAL_LOOKBACK       = 60      # jumlah trade sebelum rangkaian rugi yang dipakai sebagai pembanding
+EVAL_BENCH_WR       = 53.6    # winrate acuan: zona merah, 3 periode backtest 2026 (153 trade)
+
+_EV_SRC_NAME = {"SUPPLY": "zona merah", "DEMAND": "demand", "OB": "OB", "FVG": "FVG", "SWING": "swing", "HTFZ": "zona HTF"}
+
+
+def _ev_esc(x) -> str:
+    return str(x).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _ev_f(x, default=0.0):
+    try:
+        v = float(x)
+        return v if v == v else default   # NaN -> default
+    except Exception:
+        return default
+
+
+def _ev_is_loss(t: dict) -> bool:
+    return _ev_f(t.get("pnl_usdt")) <= 0   # sama dengan update_performance()
+
+
+def _ev_close_dt(t: dict):
+    try:
+        return datetime.fromisoformat(str(t["ts"]))
+    except Exception:
+        return None
+
+
+def _ev_open_dt(t: dict):
+    c = _ev_close_dt(t)
+    if c is None:
+        return None
+    return c - timedelta(seconds=int(_ev_f(t.get("duration_sec"))))
+
+
+def _ev_median(vals):
+    v = sorted(x for x in vals if x is not None)
+    if not v:
+        return None
+    m = len(v) // 2
+    return v[m] if len(v) % 2 else (v[m - 1] + v[m]) / 2
+
+
+def _ev_fmt_dur(hours: float) -> str:
+    return f"{hours:.0f} jam" if hours < 48 else f"{hours / 24:.1f} hari"
+
+
+def _ev_max_open():
+    try:
+        return int(globals().get("MAX_OPEN_TRADES"))
+    except Exception:
+        return None
+
+
+def _ev_tail_streak(log: list) -> list:
+    """Trade rugi berturut-turut di ujung log (urut lama -> baru)."""
+    out = []
+    for t in reversed(log):
+        if _ev_is_loss(t):
+            out.append(t)
+        else:
+            break
+    out.reverse()
+    return out
+
+
+def _ev_p_streak(n_trades: int, q: float, L: int) -> float:
+    """Peluang ada minimal 1 rangkaian rugi >= L dalam n_trades, bila peluang rugi tiap trade = q (anggap bebas)."""
+    if L <= 0:
+        return 1.0
+    q = min(max(q, 0.01), 0.99)
+    dp = [0.0] * L
+    dp[0] = 1.0
+    hit = 0.0
+    for _ in range(int(n_trades)):
+        new = [0.0] * L
+        new[0] += sum(dp) * (1 - q)
+        for j in range(L - 1):
+            new[j + 1] += dp[j] * q
+        hit += dp[L - 1] * q
+        dp = new
+    return hit
+
+
+def _ev_trades_per_month(log: list) -> int:
+    times = [d for d in (_ev_close_dt(t) for t in log) if d]
+    if len(times) < 10:
+        return 55
+    span_days = max((max(times) - min(times)).total_seconds() / 86400, 1.0)
+    return int(min(max(len(times) / span_days * 30, 10), 200))
+
+
+def _ev_mfe_r(t: dict):
+    """Seberapa jauh posisi sempat untung sebelum ditutup, dalam satuan R (1R = jarak ke SL)."""
+    slp = _ev_f(t.get("sl_atr_mult")) * _ev_f(t.get("atr_pct"))
+    if slp <= 0:
+        return None
+    return _ev_f(t.get("mfe_pct")) / slp
+
+
+def _ev_btc_flip(t: dict):
+    """True = BTC (TF pendek) berbalik MELAWAN posisi setelah entry | False | None = data tidak ada."""
+    now = str(t.get("btc_ltf_dir_at_close") or "?").upper()
+    if now in ("?", "-", "", "NONE"):
+        return None
+    against = "BULLISH" if str(t.get("direction", "")).upper() == "SHORT" else "BEARISH"
+    was = str(t.get("btc_ltf_dir") or "?").upper()
+    return now == against and was != against
+
+
+def _ev_concurrency(trades: list, universe: list) -> int:
+    """Jumlah posisi LAIN yang masih terbuka saat tiap trade dibuka (dari log), ambil yang terbesar."""
+    best = 0
+    for t in trades:
+        o = _ev_open_dt(t)
+        if not o:
+            continue
+        c = 0
+        for u in universe:
+            if u is t:
+                continue
+            uo, uc = _ev_open_dt(u), _ev_close_dt(u)
+            if uo and uc and uo <= o < uc:
+                c += 1
+        best = max(best, c)
+    return best
+
+
+def _ev_analyze_streak(streak: list, log: list) -> dict:
+    n = len(streak)
+    prior = log[: len(log) - n] if n <= len(log) else []
+    hist = prior[-EVAL_LOOKBACK:]
+    universe = log[-200:]
+    F, C, T = [], [], []   # ciri-ciri, kemungkinan penyebab, saran
+
+    loss_total = sum(_ev_f(t.get("pnl_usdt")) for t in streak)
+    opens = [d for d in (_ev_open_dt(t) for t in streak) if d]
+    closes = [d for d in (_ev_close_dt(t) for t in streak) if d]
+    span_h = (max(closes) - min(opens)).total_seconds() / 3600 if opens and closes else None
+    open_span_h = (max(opens) - min(opens)).total_seconds() / 3600 if len(opens) >= 2 else None
+
+    # 1) arah & sebaran pair
+    dirs = [str(t.get("direction", "?")).upper() for t in streak]
+    top_dir = max(set(dirs), key=dirs.count) if dirs else "?"
+    same_dir = dirs.count(top_dir)
+    syms = [str(t.get("symbol", "?")).replace("USDT", "") for t in streak]
+    uniq = len(set(syms))
+    f_dir = n >= 3 and same_dir / n >= 0.8
+    f_spread = n >= 3 and uniq / n >= 0.7
+    h_dirs = [str(t.get("direction", "?")).upper() for t in hist]
+    one_sided = len(h_dirs) >= 10 and h_dirs.count(top_dir) / len(h_dirs) >= 0.85
+    F.append(
+        f"{same_dir} dari {n} trade searah ({top_dir}), tersebar di {uniq} pair"
+        + (f" (hampir semua trade bot memang {top_dir}, jadi searahnya wajar)" if one_sided else "")
+    )
+    rep = sorted(x for x in set(syms) if syms.count(x) >= 2)
+    if rep:
+        F.append("Pair yang kalah berulang: " + ", ".join(f"{x} ({syms.count(x)}x)" for x in rep))
+    if open_span_h is not None and n >= 3:
+        F.append(f"Semua dibuka dalam rentang {_ev_fmt_dur(open_span_h)}")
+
+    # 2) cara kalahnya
+    mfes = [m for m in (_ev_mfe_r(t) for t in streak) if m is not None]
+    f_instant = f_late = False
+    if len(mfes) >= 3:
+        k_inst = sum(1 for m in mfes if m < 0.1)
+        k_late = sum(1 for m in mfes if m >= 0.6)
+        F.append(
+            f"Cara kalahnya: {k_inst} langsung ke SL tanpa sempat untung, {k_late} sempat untung 0,6R atau lebih "
+            f"lalu berbalik (dari {len(mfes)} trade; di backtest biasanya sekitar 19% dan 29%)"
+        )
+        f_instant = k_inst >= 3 and k_inst / len(mfes) >= 0.5
+        f_late = k_late >= 3 and k_late / len(mfes) >= 0.4
+
+    # 3) BTC berbalik setelah masuk (hanya kalau datanya tercatat)
+    flips = [b for b in (_ev_btc_flip(t) for t in streak) if b is not None]
+    f_flip = False
+    if len(flips) >= 3:
+        k = sum(1 for b in flips if b)
+        F.append(f"BTC berbalik melawan posisi setelah kita masuk: {k} dari {len(flips)} trade")
+        f_flip = k / len(flips) >= 0.5
+
+    # 4) posisi yang menumpuk
+    stack = _ev_concurrency(streak, universe)
+    f_stack = stack >= 5
+    if stack >= 3:
+        F.append(f"Posisi lain yang sedang terbuka saat masuk: sampai {stack}")
+
+    # 5) kondisi saat masuk dibanding trade menang sebelumnya
+    wins_h = [t for t in hist if not _ev_is_loss(t)]
+    if len(wins_h) >= 8:
+        a_s = _ev_median([_ev_f(t.get("atr_pct")) for t in streak if _ev_f(t.get("atr_pct")) > 0])
+        a_w = _ev_median([_ev_f(t.get("atr_pct")) for t in wins_h if _ev_f(t.get("atr_pct")) > 0])
+        if a_s and a_w and a_s >= 1.5 * a_w:
+            F.append(f"Volatilitas saat masuk lebih tinggi dari biasa (ATR {a_s:.2f}% vs {a_w:.2f}% di trade menang)")
+        r_s = _ev_median([_ev_f(t.get("rsi_entry")) for t in streak if _ev_f(t.get("rsi_entry")) > 0])
+        r_w = _ev_median([_ev_f(t.get("rsi_entry")) for t in wins_h if _ev_f(t.get("rsi_entry")) > 0])
+        if r_s and r_w and abs(r_s - r_w) >= 8:
+            F.append(f"RSI saat masuk berbeda dari biasa ({r_s:.0f} vs {r_w:.0f} di trade menang)")
+
+    # 6) jenis sinyal
+    srcs = {}
+    for t in streak:
+        k = _EV_SRC_NAME.get(str(t.get("sl_source", "?")), str(t.get("sl_source", "?")))
+        srcs[k] = srcs.get(k, 0) + 1
+    F.append("Jenis sinyal: " + ", ".join(f"{k} {v}" for k, v in sorted(srcs.items(), key=lambda x: -x[1])))
+
+    # 7) wajar atau tidak
+    hn = len(hist)
+    wr_hist = (sum(1 for t in hist if not _ev_is_loss(t)) / hn * 100) if hn >= 20 else EVAL_BENCH_WR
+    n_month = _ev_trades_per_month(log)
+    p = _ev_p_streak(n_month, 1 - wr_hist / 100, n)
+    label = "masih wajar" if p >= 0.25 else ("agak jarang" if p >= 0.05 else "jarang kalau cuma kebetulan")
+    sumber_wr = f"dari {hn} trade sebelumnya" if hn >= 20 else "acuan backtest"
+    p_text = (
+        f"Dengan winrate {wr_hist:.0f}% ({sumber_wr}) dan sekitar {n_month} trade per bulan, rugi beruntun "
+        f"{n}x atau lebih muncul minimal sekali sebulan dengan peluang {('kurang dari 1%' if p < 0.005 else 'sekitar ' + format(p * 100, '.0f') + '%')} → <b>{label}</b>. "
+        f"(Hitungan ini menganggap tiap trade berdiri sendiri; kenyataannya rugi sering menggerombol karena "
+        f"altcoin bergerak serempak, jadi rangkaian yang lebih panjang tetap bisa muncul.)"
+    )
+
+    # 8) kemungkinan penyebab + saran
+    mo = _ev_max_open()
+    if mo is not None and mo > 3:
+        tip_mo = f"Max open sekarang {mo}. Di backtest, 8 posisi atau lebih terbuka bersamaan membuat winrate turun jauh. Coba /maxopentrade 3."
+    elif mo is not None:
+        tip_mo = (f"Max open sudah {mo} (batas aman di backtest). Rangkaian panjang tetap bisa terjadi kalau pasar bergerak "
+                  f"serempak melawan posisi; itu risiko yang memang ada di strategi ini.")
+    else:
+        tip_mo = "Jaga /maxopentrade di 3. Di backtest, 8 posisi atau lebih terbuka bersamaan membuat winrate turun jauh."
+    if f_dir and f_spread and (open_span_h is None or open_span_h <= 72):
+        C.append(f"Banyak pair berbeda kalah dalam waktu berdekatan ({uniq} pair, {_ev_fmt_dur(open_span_h) if open_span_h is not None else 'singkat'}). "
+                 f"Biasanya ini satu gerakan pasar yang melawan kita, bukan satu pair yang jelek.")
+        T.append(tip_mo)
+    if f_flip:
+        C.append("BTC berbalik melawan posisi setelah kita masuk.")
+        T.append("Filter BTC hanya dicek saat masuk. Menutup lebih awal saat BTC berbalik adalah ide yang BELUM diuji backtest.")
+    if f_instant:
+        C.append("Banyak trade langsung berbalik setelah masuk, artinya zona tidak bertahan.")
+        T.append("Jangan ubah setelan dulu. Kumpulkan data lebih banyak, lalu uji filter baru di beberapa periode seperti yang kita lakukan untuk BTC dan tren 1 jam.")
+    if f_late:
+        C.append("Banyak trade sempat untung lalu berbalik sebelum menyentuh TP.")
+        T.append("Di backtest, TP 1,5R tetap lebih baik daripada 1,0R. Jangan buru-buru menurunkan TP.")
+    if f_stack and not (f_dir and f_spread):
+        C.append(f"Posisi menumpuk (sampai {stack} terbuka bersamaan), jadi satu gerakan pasar mengenai banyak posisi.")
+        T.append(tip_mo)
+    if not C:
+        C.append("Tidak ada pola yang jelas. Kemungkinan besar variasi biasa.")
+    if p >= 0.25:
+        T.insert(0, "Rangkaian rugi sepanjang ini masih sering terjadi walau strateginya sehat. Jangan ubah setelan hanya karena satu rangkaian.")
+    T.append("Butuh minimal 30 trade sebelum menyimpulkan sesuatu. Cek lagi dengan /evaluasi 30.")
+
+    return {"n": n, "loss_total": loss_total, "span_h": span_h, "findings": F, "causes": C, "tips": T, "p_text": p_text}
+
+
+def _ev_trade_line(t: dict) -> str:
+    sym = str(t.get("symbol", "?")).replace("USDT", "")
+    src = _EV_SRC_NAME.get(str(t.get("sl_source", "?")), str(t.get("sl_source", "?")))
+    return f"• {_ev_esc(sym)} {_ev_esc(t.get('direction', '?'))} {_ev_f(t.get('pnl_usdt')):+.2f} ({_ev_esc(t.get('close_type', '?'))}, {_ev_esc(src)})"
+
+
+def _ev_streak_text(streak: list, log: list, auto: bool = False) -> str:
+    a = _ev_analyze_streak(streak, log)
+    n = a["n"]
+    L = []
+    L.append(f"🔎 <b>EVALUASI RUGI BERUNTUN</b>{' (otomatis)' if auto else ''} — <b>{n}x</b> berturut-turut")
+    L.append("─" * 30)
+    span = f" | rentang {_ev_fmt_dur(a['span_h'])}" if a.get("span_h") else ""
+    L.append(f"💸 Total rugi: <b>{a['loss_total']:+.2f} USDT</b>{span}")
+    for t in streak[-8:]:
+        L.append(_ev_trade_line(t))
+    if n > 8:
+        L.append(f"… dan {n - 8} trade sebelumnya")
+    L.append("")
+    L.append("📊 <b>Wajar atau tidak?</b>")
+    L.append(a["p_text"])
+    L.append("")
+    L.append("🧩 <b>Ciri-ciri yang terlihat</b>")
+    L += [f"• {x}" for x in a["findings"]]
+    L.append("")
+    L.append("🧭 <b>Kemungkinan penyebab</b>")
+    L += [f"• {x}" for x in a["causes"]]
+    L.append("")
+    L.append("💡 <b>Saran</b> (tidak diterapkan otomatis)")
+    L += [f"• {x}" for x in a["tips"]]
+    L.append("")
+    L.append("ℹ️ Bot TIDAK berhenti atau mengubah setelan sendiri. Di backtest, berhenti setelah rugi beruntun malah menurunkan total hasil.")
+    return "\n".join(L)[:3900]
+
+
+def _ev_summary_text(window: list, log: list) -> str:
+    n = len(window)
+    if n == 0:
+        return "📭 Belum ada trade di log."
+    wins = [t for t in window if not _ev_is_loss(t)]
+    losses = [t for t in window if _ev_is_loss(t)]
+    pnl = sum(_ev_f(t.get("pnl_usdt")) for t in window)
+    gp = sum(_ev_f(t.get("pnl_usdt")) for t in wins)
+    gl = -sum(_ev_f(t.get("pnl_usdt")) for t in losses)
+    wr = len(wins) / n * 100
+    pf = f"{gp / gl:.2f}" if gl > 0 else "-"
+    p0 = EVAL_BENCH_WR / 100
+    band = 1.96 * (p0 * (1 - p0) / n) ** 0.5 * 100
+    if abs(wr - EVAL_BENCH_WR) <= band:
+        verdict = "di dalam kisaran wajar"
+    elif wr > EVAL_BENCH_WR:
+        verdict = "di atas kisaran wajar"
+    else:
+        verdict = "DI BAWAH kisaran wajar"
+    L = []
+    L.append(f"📈 <b>EVALUASI {n} TRADE TERAKHIR</b>")
+    L.append("─" * 30)
+    L.append(f"Hasil: <b>{pnl:+.2f} USDT</b> | winrate <b>{wr:.1f}%</b> ({len(wins)}M / {len(losses)}K) | profit factor {pf}")
+    L.append(f"Acuan backtest {EVAL_BENCH_WR:.1f}% — dengan {n} trade, kisaran wajarnya {EVAL_BENCH_WR - band:.0f}% sampai {EVAL_BENCH_WR + band:.0f}% → winrate kamu <b>{verdict}</b>.")
+    if n < 30:
+        L.append("⚠️ Sampel masih kecil (kurang dari 30 trade), jangan simpulkan terlalu jauh.")
+    by = {}
+    for t in window:
+        k = _EV_SRC_NAME.get(str(t.get("sl_source", "?")), str(t.get("sl_source", "?")))
+        d = by.setdefault(k, [0, 0, 0.0])
+        d[0] += 1
+        d[1] += 0 if _ev_is_loss(t) else 1
+        d[2] += _ev_f(t.get("pnl_usdt"))
+    L.append("")
+    L.append("<b>Per jenis sinyal</b>")
+    for k, (c, w, pp) in sorted(by.items(), key=lambda x: -x[1][0]):
+        L.append(f"• {_ev_esc(k)}: {c} trade, winrate {w / c * 100:.0f}%, {pp:+.2f} USDT")
+    bp = {}
+    for t in window:
+        k = str(t.get("symbol", "?")).replace("USDT", "")
+        bp[k] = bp.get(k, 0.0) + _ev_f(t.get("pnl_usdt"))
+    worst = sorted(bp.items(), key=lambda x: x[1])[:3]
+    best = sorted(bp.items(), key=lambda x: -x[1])[:3]
+    L.append("")
+    L.append("<b>Pair terburuk:</b> " + ", ".join(f"{_ev_esc(k)} {v:+.1f}" for k, v in worst))
+    L.append("<b>Pair terbaik:</b> " + ", ".join(f"{_ev_esc(k)} {v:+.1f}" for k, v in best))
+    # rugi beruntun terpanjang dalam jendela
+    run = mx = 0
+    for t in window:
+        run = run + 1 if _ev_is_loss(t) else 0
+        mx = max(mx, run)
+    L.append(f"Rugi beruntun terpanjang di jendela ini: <b>{mx}x</b>")
+    return "\n".join(L)[:3900]
+
+
+def _eval_after_trade():
+    """Dipanggil (thread terpisah) setelah tiap trade tercatat. Kirim evaluasi kalau rangkaian rugi mencapai pemicu."""
+    try:
+        if not EVAL_ENABLED:
+            return
+        with _trade_log_lock:
+            log = list(_load_trade_log())
+        streak = _ev_tail_streak(log)
+        n = len(streak)
+        if n < EVAL_STREAK_TRIGGER or (n - EVAL_STREAK_TRIGGER) % max(EVAL_STREAK_STEP, 1) != 0:
+            return
+        send_telegram_raw(_ev_streak_text(streak, log, auto=True))
+    except Exception as e:
+        print(f"⚠️ [evaluasi] gagal: {e}")
+
+
+def cmd_evaluasi(parts: list):
+    """
+    /evaluasi             → evaluasi rangkaian rugi yang sedang berjalan (kalau ada) + ringkasan 30 trade terakhir
+    /evaluasi 50          → ringkasan 50 trade terakhir (5 sampai 200)
+    /evaluasi on | off    → nyalakan / matikan kiriman otomatis saat rugi beruntun
+    /evaluasi trigger 4   → kirim otomatis mulai rugi beruntun ke-4 (2 sampai 10)
+    """
+    global EVAL_ENABLED, EVAL_STREAK_TRIGGER
+    args = [a.lower() for a in parts[1:] if a.strip()]
+    if args and args[0] in ("on", "off"):
+        EVAL_ENABLED = args[0] == "on"
+        save_state()
+        send_telegram_raw(f"✅ Evaluasi otomatis: <b>{'NYALA' if EVAL_ENABLED else 'MATI'}</b> (pemicu: rugi beruntun {EVAL_STREAK_TRIGGER}x)")
+        return
+    if args and args[0] in ("trigger", "pemicu"):
+        try:
+            v = int(args[1])
+            if not (2 <= v <= 10):
+                raise ValueError
+        except Exception:
+            send_telegram_raw("⚠️ Contoh: <code>/evaluasi trigger 4</code> (angka 2 sampai 10)")
+            return
+        EVAL_STREAK_TRIGGER = v
+        save_state()
+        send_telegram_raw(f"✅ Evaluasi otomatis dikirim mulai rugi beruntun ke-<b>{v}</b>, lalu tiap +{EVAL_STREAK_STEP}.")
+        return
+    with _trade_log_lock:
+        log = list(_load_trade_log())
+    if not log:
+        send_telegram_raw("📭 Belum ada trade di log, jadi belum ada yang bisa dievaluasi.")
+        return
+    n_win = 30
+    if args and args[0].isdigit():
+        n_win = max(5, min(200, int(args[0])))
+        send_telegram_raw(_ev_summary_text(log[-n_win:], log))
+        return
+    streak = _ev_tail_streak(log)
+    if streak:
+        send_telegram_raw(_ev_streak_text(streak, log, auto=False))
+    else:
+        send_telegram_raw("✅ Trade terakhir menang, jadi sedang tidak ada rangkaian rugi.")
+    send_telegram_raw(_ev_summary_text(log[-n_win:], log))
 
 
 def cmd_dedupelog(parts: list = None):
@@ -13978,6 +14423,7 @@ _TRADE_LOG_CSV_FIELDS = [
     # ── Penanda versi bot (baris lama = kosong) ────────────────────────────
     "bot_version", "build_date", "git_sha", "git_branch",
     "github_account", "github_repo", "railway_deploy_id", "railway_env",
+    "last_edit", "edited_by",
 ]
 
 
@@ -15514,6 +15960,126 @@ def cmd_setscoreupto(parts: list):
     )
 
 
+def _pairs_norm(tok: str):
+    """BTC -> BTCUSDT, shib -> 1000SHIBUSDT (kalau ada di daftar bot)."""
+    t = tok.strip().upper().replace("/", "").replace("-", "").replace("_", "")
+    if not t:
+        return None
+    if not t.endswith("USDT"):
+        t += "USDT"
+    if t in BASE_PAIRS:
+        return t
+    alt = "1000" + t
+    return alt if alt in BASE_PAIRS else t
+
+
+def _pairs_parse(tokens: list):
+    """-> (pair valid urut sesuai BASE_PAIRS, token yang tidak dikenal)."""
+    raw = []
+    for a in tokens:
+        raw += [x for x in a.replace(",", " ").split() if x.strip()]
+    ok, bad = set(), []
+    for r in raw:
+        p = _pairs_norm(r)
+        if p in BASE_PAIRS:
+            ok.add(p)
+        else:
+            bad.append(r)
+    return [p for p in BASE_PAIRS if p in ok], bad
+
+
+def _pairs_status_text() -> str:
+    shown = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
+    total = len(BASE_PAIRS)
+    if _PAIR_SELECTION:
+        head = f"🎯 <b>TERPILIH</b> — {len(shown)} dari {total} pair"
+    else:
+        head = f"🌐 <b>SEMUA</b> — {total} pair"
+    names = ", ".join(p.replace("USDT", "") for p in shown)
+    try:
+        n_valid = len(get_active_pairs())
+    except Exception:
+        n_valid = len(shown)
+    return (
+        f"📡 <b>Pair yang Dipantau</b>\n"
+        f"{'─'*34}\n"
+        f"{head}\n"
+        f"{names}\n"
+        f"{'─'*34}\n"
+        f"✅ Dipindai di mode {BOT_MODE}: <b>{n_valid}</b> pair\n"
+        f"ℹ️ Berlaku mulai putaran scan berikutnya. Posisi yang sudah terbuka tetap dikelola sampai selesai."
+    )
+
+
+def cmd_pairs(parts: list):
+    """
+    /pairs                    → lihat pair yang dipantau sekarang
+    /pairs all                → pantau SEMUA pair
+    /pairs 15                 → 15 pair pertama di daftar bot
+    /pairs BTC,ETH,SOL        → hanya pair ini (nama pendek boleh: BTC, shib, pepe)
+    /pairs add DOGE,SUI       → tambah pair ke pilihan sekarang
+    /pairs remove DOGE        → keluarkan pair dari pilihan sekarang
+    Tanpa restart; tersimpan di bot_state.json.
+    """
+    global _PAIR_SELECTION
+    args = [a for a in parts[1:] if a.strip()]
+    usage = (
+        "\n\nCara pakai:\n"
+        "<code>/pairs all</code> → semua pair\n"
+        "<code>/pairs 15</code> → 15 pair pertama\n"
+        "<code>/pairs BTC,ETH,SOL</code> → hanya pair ini\n"
+        "<code>/pairs add DOGE</code> / <code>/pairs remove DOGE</code>"
+    )
+    if not args:
+        send_telegram_raw(_pairs_status_text() + usage)
+        return
+
+    first = args[0].lower()
+    total = len(BASE_PAIRS)
+
+    if first in ("all", "semua", "reset"):
+        new_sel = None
+    elif first.isdigit():
+        n = int(first)
+        if not (1 <= n <= total):
+            send_telegram_raw(f"⚠️ Jumlah pair harus antara <b>1</b> sampai <b>{total}</b>.")
+            return
+        new_sel = None if n == total else list(BASE_PAIRS)[:n]
+    elif first in ("add", "tambah", "remove", "hapus", "del"):
+        picked, bad = _pairs_parse(args[1:])
+        if bad or not picked:
+            send_telegram_raw(
+                "⚠️ Pair tidak dikenal: <b>" + (", ".join(bad) if bad else "(kosong)") + "</b>\n"
+                "Pair harus ada di daftar bot. Contoh: <code>/pairs add DOGE,SUI</code>"
+            )
+            return
+        cur = list(_PAIR_SELECTION) if _PAIR_SELECTION else list(BASE_PAIRS)
+        if first in ("add", "tambah"):
+            cur = [p for p in BASE_PAIRS if p in set(cur) | set(picked)]
+        else:
+            cur = [p for p in cur if p not in set(picked)]
+        if not cur:
+            send_telegram_raw("⚠️ Minimal harus ada <b>1 pair</b> yang dipantau.")
+            return
+        new_sel = None if len(cur) == total else cur
+    else:
+        picked, bad = _pairs_parse(args)
+        if bad or not picked:
+            send_telegram_raw(
+                "⚠️ Pair tidak dikenal: <b>" + (", ".join(bad) if bad else "(kosong)") + "</b>\n"
+                "Pair harus ada di daftar bot. Contoh: <code>/pairs BTC,ETH,SOL</code>"
+            )
+            return
+        new_sel = None if len(picked) == total else picked
+
+    old_txt = f"{len(_PAIR_SELECTION)} pair" if _PAIR_SELECTION else "semua pair"
+    _PAIR_SELECTION = new_sel
+    save_state()
+    new_txt = f"{len(new_sel)} pair" if new_sel else "semua pair"
+    print(f"⚙️ /pairs diubah: {old_txt} → {new_txt}")
+    send_telegram_raw(f"✅ <b>Pair Diubah</b>: {old_txt} → <b>{new_txt}</b>\n\n" + _pairs_status_text())
+
+
 def cmd_maxopentrade(parts: list):
     """
     /maxopentrade <jumlah>
@@ -15785,6 +16351,8 @@ def cmd_changeliveordemo():
 # ── Backtest State ────────────────────────────────────────────────────────────
 _backtest_running = False
 _backtest_proc = None
+_zonestudy_running = False
+_zonestudy_proc = None
 
 
 
@@ -16128,6 +16696,7 @@ def cmd_menu():
         [{"text": "📊 Recap", "callback_data": "/recap"}],
         [{"text": "🧹 Cleanup Orders", "callback_data": "/cleanuporders"},
          {"text": "🧹 Cleanup Duplicate", "callback_data": "/cleanupduplicate"}],
+        [{"text": "📡 Pairs", "callback_data": "/pairs"}, {"text": "🔎 Evaluasi", "callback_data": "/evaluasi"}],
         [{"text": "❓ Help", "callback_data": "/help"}],
     ]
     send_message_with_keyboard("🤖 <b>Menu Bot</b> — tap tombol di bawah:", keyboard)
@@ -16156,7 +16725,16 @@ def _backtest_send_result(summary_path: str, csv_path: str):
     try:
         with open(summary_path, "r", encoding="utf-8") as f:
             txt = f.read().strip()
-        send_telegram_raw("<pre>" + _html.escape(txt[:3800]) + "</pre>")
+        _mk = txt.find("EVALUASI BACKTEST (otomatis")
+        head = txt[:_mk].strip() if _mk > 0 else txt
+        send_telegram_raw("<pre>" + _html.escape(head[:3800]) + "</pre>")
+        if _mk > 0:
+            # evaluasi dikirim terpisah (ringkasan + rugi beruntun terpanjang), karena ringkasan di atas sudah penuh
+            ev = txt[_mk:].strip()
+            part1, _, part2 = ev.partition("RUGI BERUNTUN TERPANJANG:")
+            send_telegram_raw("<pre>" + _html.escape(part1.strip()[:3800]) + "</pre>")
+            if part2.strip():
+                send_telegram_raw("<pre>" + _html.escape(("RUGI BERUNTUN TERPANJANG:" + part2)[:3800]) + "</pre>")
     except Exception as e:
         send_telegram_raw(f"⚠️ Gagal baca ringkasan backtest: <code>{e}</code>")
     try:
@@ -16220,6 +16798,7 @@ def cmd_backtest(parts):
       /backtest               → 7 hari, 15 pair pertama
       /backtest 14 all        → 14 hari, semua pair
       /backtest 7 BTCUSDT,ETHUSDT
+      /backtest 30 live sz1   → pair SAMA dengan yang dipantau live (lihat /pairs)
       /backtest 30 15 2026-10-12   → 30 hari SEBELUM 12 Okt 2026 (UTC)
       /backtest 60 15 2026-10-11 rand2 → BASELINE ACAK (seed 2): entry acak tanpa sinyal SMC,
                                          exit/fee/risk sama. Pembanding "apakah sinyal bot punya edge?"
@@ -16290,6 +16869,8 @@ def cmd_backtest(parts):
             days = int(parts[1])
         if len(parts) > 2:
             pairs = parts[2]
+            if pairs.lower() == "live":
+                pairs = ",".join(get_active_pairs())   # pair yang sama dengan yang dipantau bot (/pairs)
         if len(parts) > 3:
             end = parts[3].strip()
             import re as _re
@@ -16422,6 +17003,13 @@ def cmd_backtest(parts):
                 import html as _html
                 send_telegram_raw("❌ <b>Backtest gagal</b> (kode " + str(rc) + ")\n<pre>"
                                   + _html.escape("\n".join(tail)[-1500:]) + "</pre>")
+                if any("unrecognized arguments" in _l for _l in tail):
+                    send_telegram_raw(
+                        "💡 <b>backtest.py di server masih versi LAMA</b> (tidak mengenal kode yang baru).\n"
+                        "Upload <code>backtest_demand.py</code> dengan nama <code>backtest.py</code> (menimpa yang lama), "
+                        "di folder yang sama dengan <code>main.py</code>, lalu restart bot.\n"
+                        "Cek: header laporan backtest harus menampilkan baris <b>Diedit</b> dan versi terbaru."
+                    )
         except Exception as e:
             send_telegram_raw(f"❌ Backtest error: <code>{e}</code>")
         finally:
@@ -16434,6 +17022,165 @@ def cmd_backtest(parts):
         + (f" | MODE {mode_label}" if mode_label else "") + "\n"
         f"Berjalan terpisah dari trading live — log TIDAK bercampur dengan trade_log.\n"
         f"Bisa lama (menit). Perintah: <code>/backtest status</code>, <code>/backtest stop</code>."
+    )
+    _th.Thread(target=_run, daemon=True).start()
+
+
+def _zonestudy_send_result(sum_path: str, csv_path: str):
+    import html as _html
+    try:
+        with open(sum_path, "r", encoding="utf-8") as f:
+            txt = f.read().strip()
+        chunks, cur = [], ""
+        for para in txt.split("\n\n"):
+            if cur and len(cur) + len(para) + 2 > 3600:
+                chunks.append(cur)
+                cur = para
+            else:
+                cur = (cur + "\n\n" + para) if cur else para
+        if cur:
+            chunks.append(cur)
+        for ch in chunks[:8]:
+            send_telegram_raw("<pre>" + _html.escape(ch[:3800]) + "</pre>")
+        if len(chunks) > 8:
+            with open(sum_path, "rb") as f:
+                send_telegram_document(f.read(), os.path.basename(sum_path), caption="📄 Laporan lengkap studi zona")
+    except Exception as e:
+        send_telegram_raw(f"⚠️ Gagal baca laporan studi zona: <code>{e}</code>")
+    try:
+        with open(csv_path, "rb") as f:
+            data = f.read()
+        send_telegram_document(data, os.path.basename(csv_path),
+                               caption="📄 Data tiap kejadian studi zona (kirim ke Claude untuk dibedah lebih dalam)")
+    except Exception as e:
+        send_telegram_raw(f"⚠️ Gagal kirim CSV studi zona: <code>{e}</code>")
+
+
+def cmd_zonestudy(parts: list):
+    """
+    /zonestudy [hari] [pair] [TF zona] [YYYY-MM-DD akhir] [ob|fvg]
+      Studi REAKSI ZONA: tiap zona OB / FVG dicatat SEKALI saat pertama disentuh, lalu dilihat reaksinya
+      (tembus / pantul / bertahan) dan RR berapa yang paling masuk akal. Bukan backtest strategi.
+      /zonestudy                    → 60 hari, 15 pair pertama, zona 1H
+      /zonestudy 90 all 1h          → 90 hari, semua pair
+      /zonestudy 60 live 4h         → pair yang sama dengan yang dipantau live, zona 4H
+      /zonestudy 60 15 1h,4h        → dua TF zona sekaligus
+      /zonestudy 60 15 1h 2026-11-20 ob → 60 hari sebelum 20 Nov 2026, hanya OB
+    /zonestudy status | stop
+    Berjalan sebagai proses TERPISAH (zone_study.py); tidak menyentuh trade_log / order.
+    """
+    global _zonestudy_running, _zonestudy_proc
+    import re as _re
+    import subprocess as _sp
+    import sys as _sys
+    import threading as _th
+
+    out_dir = os.path.join(_get_data_dir(), "backtests")
+    args = [a for a in parts[1:] if a.strip()]
+    sub = args[0].lower() if args else ""
+    if sub in ("stop", "batal", "cancel"):
+        if _zonestudy_running and _zonestudy_proc is not None:
+            try:
+                _zonestudy_proc.terminate()
+            except Exception:
+                pass
+            send_telegram_raw("🛑 Studi zona dihentikan.")
+        else:
+            send_telegram_raw("ℹ️ Tidak ada studi zona yang sedang berjalan.")
+        return
+    if sub == "status":
+        send_telegram_raw("⏳ Studi zona sedang berjalan." if _zonestudy_running else "ℹ️ Tidak ada studi zona yang sedang berjalan.")
+        return
+    if _zonestudy_running or _backtest_running:
+        send_telegram_raw("⏳ Masih ada backtest / studi zona yang berjalan. Tunggu selesai atau kirim <code>/zonestudy stop</code>.")
+        return
+
+    days, pairs, ztf, end, types = 60, "15", "1h", "", ""
+    pairs_set = False
+    try:
+        rest = list(args)
+        if rest and rest[0].isdigit():
+            days = int(rest.pop(0))
+        for tok in rest:
+            t = tok.strip()
+            tl = t.lower()
+            if _re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
+                end = t
+            elif _re.fullmatch(r"\d+[mhd](,\d+[mhd])*", tl):
+                ztf = tl
+            elif tl in ("ob", "fvg", "ob,fvg", "fvg,ob"):
+                types = tl
+            elif not pairs_set:
+                pairs, pairs_set = t, True
+            else:
+                raise ValueError(t)
+    except ValueError:
+        send_telegram_raw(
+            "❌ Format: <code>/zonestudy [hari] [all|jumlah|live|BTCUSDT,ETHUSDT] [1h|4h|1h,4h] [YYYY-MM-DD] [ob|fvg]</code>\n"
+            "Contoh: <code>/zonestudy 90 all 1h</code>"
+        )
+        return
+    if pairs.lower() == "live":
+        pairs = ",".join(get_active_pairs())
+    days = max(7, min(days, 365))
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "zone_study.py")
+    if not os.path.exists(script):
+        send_telegram_raw("❌ File <code>zone_study.py</code> belum ada di folder bot. Upload dulu bersama <code>main.py</code>.")
+        return
+    cmd = [_sys.executable, script, "--days", str(days), "--pairs", pairs, "--zone-tf", ztf, "--out", out_dir, "--tag", "tg"]
+    if end:
+        cmd += ["--end", end]
+    if types:
+        cmd += ["--types", types]
+
+    def _run():
+        global _zonestudy_running, _zonestudy_proc
+        _zonestudy_running = True
+        csv_path = sum_path = None
+        tail, sent = [], set()
+        try:
+            env = dict(os.environ)
+            env["PYTHONIOENCODING"] = "utf-8"
+            proc = _sp.Popen(cmd, stdout=_sp.PIPE, stderr=_sp.STDOUT, text=True, encoding="utf-8", errors="replace",
+                             cwd=os.path.dirname(os.path.abspath(__file__)), env=env)
+            _zonestudy_proc = proc
+            for line in proc.stdout:
+                line = line.rstrip()
+                tail = (tail + [line])[-12:]
+                if line.startswith("PROGRESS "):
+                    try:
+                        pct = int(line.split()[1])
+                    except Exception:
+                        continue
+                    for mark in (25, 50, 75):
+                        if pct >= mark and mark not in sent:
+                            sent.add(mark)
+                            send_telegram_raw(f"⏳ Studi zona {pct}% — {' '.join(line.split()[2:])}")
+                            break
+                elif line.startswith("CSV_FILE "):
+                    csv_path = line[len("CSV_FILE "):].strip()
+                elif line.startswith("SUMMARY_FILE "):
+                    sum_path = line[len("SUMMARY_FILE "):].strip()
+            rc = proc.wait()
+            if rc == 0 and csv_path and sum_path:
+                _zonestudy_send_result(sum_path, csv_path)
+            elif rc in (-15, 15, -9):
+                pass
+            else:
+                import html as _html
+                send_telegram_raw("❌ <b>Studi zona gagal</b> (kode " + str(rc) + ")\n<pre>"
+                                  + _html.escape("\n".join(tail)[-1500:]) + "</pre>")
+        except Exception as e:
+            send_telegram_raw(f"❌ Studi zona error: <code>{e}</code>")
+        finally:
+            _zonestudy_running = False
+            _zonestudy_proc = None
+
+    send_telegram_raw(
+        f"🔬 <b>Studi reaksi zona dimulai</b>\n"
+        f"Periode: {days} hari | Pair: {pairs if len(pairs) < 60 else pairs[:57] + '...'} | Zona TF: {ztf}"
+        + (f" | {types.upper()}" if types else "") + "\n"
+        f"Berjalan terpisah dari trading live. Bisa lama (menit). Perintah: <code>/zonestudy status</code>, <code>/zonestudy stop</code>."
     )
     _th.Thread(target=_run, daemon=True).start()
 
@@ -16456,6 +17203,7 @@ def cmd_getcode():
     _caption = (
         f"📄 <b>main.py</b> (yang sedang jalan di Railway)\n"
         f"🏷 {_v['bot_version']} | upload {_v['build_date']}\n"
+        f"✏️ Diedit {_v['last_edit']} oleh {_v['edited_by']}\n"
         f"🐙 {_v['github_account']}/{_v['github_repo'] or '-'} "
         f"({_v['git_branch'] or '-'} @ {_v['git_sha'] or '-'})\n"
         f"📦 {len(_data)/1024:.0f} KB"
@@ -16497,6 +17245,12 @@ def handle_command(text: str):
         cmd_setmarginratio(parts)
     elif cmd == "/maxopentrade":
         cmd_maxopentrade(parts)
+    elif cmd == "/pairs":
+        cmd_pairs(parts)
+    elif cmd == "/evaluasi":
+        cmd_evaluasi(parts)
+    elif cmd == "/zonestudy":
+        cmd_zonestudy(parts)
     elif cmd in ("/setscoreupto", "/setscore"):
         cmd_setscoreupto(parts)
     elif cmd in ("/maxtradesperday", "/maxtradeperday", "/maxtradeday"):
@@ -16586,6 +17340,25 @@ def handle_command(text: str):
             "/maxopentrade &lt;jumlah&gt;\n"
             "  Ubah max posisi yang boleh dibuka bersamaan (1–20), contoh:\n"
             "  <code>/maxopentrade 3</code>\n\n"
+            "/pairs\n"
+            "  Atur pair yang dipantau bot, tanpa restart (berlaku di scan berikutnya):\n"
+            "  <code>/pairs</code> → lihat pair sekarang\n"
+            "  <code>/pairs all</code> → semua pair\n"
+            "  <code>/pairs 15</code> → 15 pair pertama\n"
+            "  <code>/pairs BTC,ETH,SOL</code> → hanya pair ini\n"
+            "  <code>/pairs add DOGE</code> / <code>/pairs remove DOGE</code>\n\n"
+            "/evaluasi\n"
+            "  Evaluasi kenapa rugi beruntun + ringkasan trade terakhir (hanya laporan, tidak mengubah setelan):\n"
+            "  <code>/evaluasi</code> → rangkaian rugi sekarang + 30 trade terakhir\n"
+            "  <code>/evaluasi 50</code> → ringkasan 50 trade terakhir\n"
+            "  <code>/evaluasi on</code> / <code>off</code> → kiriman otomatis saat rugi beruntun\n"
+            "  <code>/evaluasi trigger 4</code> → mulai kirim di rugi beruntun ke-4\n\n"
+            "/zonestudy\n"
+            "  Studi reaksi zona OB / FVG: apa yang terjadi saat harga pertama kali masuk zona, dan RR berapa yang masuk akal:\n"
+            "  <code>/zonestudy</code> → 60 hari, 15 pair, zona 1H\n"
+            "  <code>/zonestudy 90 all 1h</code> → 90 hari, semua pair\n"
+            "  <code>/zonestudy 60 live 4h</code> → pair yang dipantau live, zona 4H\n"
+            "  <code>/zonestudy status</code> / <code>stop</code>\n\n"
             "/maxtradesperday &lt;jumlah&gt;\n"
             "  Batas jumlah trade yang boleh DIBUKA per hari UTC (0 = tanpa batas).\n"
             "  Yang dihitung hanya order yang TERISI; reset otomatis UTC 00:00,\n"
@@ -18021,7 +18794,9 @@ def analyze_pair(pair, mode, df_htf, df_ref, btc_bias, btcd_trend, session, sign
     # 444 trade nemu rr1 di rentang [2.5, 4.0) WR cuma 18-23% (-16.4R
     # gabungan), jauh lebih jelek daripada sweet spot RR 1.5-2.0 (WR 40%,
     # +25.7R). RR di zona ini ditolak.
-    if 2.5 <= rr1 < 4.0:
+    # 2026-11-26: DIKECUALIKAN untuk mode zona (SHORT supply / LONG demand). Aturan ini dibuat dari strategi lama;
+    # untuk mode zona, TP tunggal (sr<R>) harus bebas diuji di 2R / 3R (studi zona menunjukkan RR besar layak diuji).
+    if 2.5 <= rr1 < 4.0 and not _zone_rev:
         print(f"  ⛔ [{label}] {pair} — RR {rr1:.2f} di dead-zone [2.5, 4.0) (ditolak)")
         return
 
@@ -18496,7 +19271,7 @@ def send_startup_ip(max_retries: int = 5, wait_seconds: int = 30):
         )
         print("❌ Gagal deteksi IP publik — bot tetap lanjut, cek internet kamu.")
 
-    print(f"🏷  BOT_VERSION={BOT_VERSION} | BUILD_DATE={BUILD_DATE} | "
+    print(f"🏷  BOT_VERSION={BOT_VERSION} | BUILD_DATE={BUILD_DATE} | LAST_EDIT={LAST_EDIT} | EDITED_BY={EDITED_BY} | "
           f"GitHub={_bot_version_fields()['github_account']}")
     send_telegram_raw(msg)
 
@@ -18526,7 +19301,7 @@ def main():
     print(f"⚡ Leverage    : Auto-tier (5x-20x by price) | Max Trades: {MAX_OPEN_TRADES} (dynamic, scale otomatis)")
     print(f"🚀 Scan Config : interval={SCAN_INTERVAL}s | workers={MAX_WORKERS}  ← VERIFIKASI VERSI DEPLOY DI SINI")
     print()
-    print("TELEGRAM COMMANDS: /start /pnl /status /resumeorpause /closeallposition /changeliveordemo /setmarginratio /maxopentrade /maxtradesperday /resetpnl /cleanuporders /help")
+    print("TELEGRAM COMMANDS: /start /pnl /status /resumeorpause /closeallposition /changeliveordemo /setmarginratio /maxopentrade /maxtradesperday /pairs /resetpnl /cleanuporders /help")
     print("=" * 70)
 
     # Kirim IP publik ke Telegram + countdown 30 detik untuk whitelist
@@ -18602,6 +19377,9 @@ def main():
         f"  /changeliveordemo — ganti LIVE/DEMO (saat ini: <b>{mode_em}</b>)\n"
         f"  /setmarginratio — set max SL loss % per trade\n"
         f"  /maxopentrade — ubah max posisi\n"
+        f"  /pairs — atur pair yang dipantau\n"
+        f"  /evaluasi — evaluasi rugi beruntun\n"
+        f"  /zonestudy — studi reaksi zona OB/FVG\n"
         f"  /maxtradesperday — batas trade per hari\n"
         f"{'─'*38}\n"
         f"Ketik <b>/start</b> untuk konek ke Binance & mulai trading.\n"
