@@ -46,6 +46,10 @@ if HERE not in sys.path:
 # ═════════════════════════════════════════════════════════════════════════════
 #  SETTING (bisa ditimpa argumen CLI)
 # ═════════════════════════════════════════════════════════════════════════════
+ZS_VERSION = "zs2-rezim-lambat"
+ZS_LAST_EDIT = "2026-11-27 14:14 WIB"           # tanggal & jam edit terakhir (WIB = UTC+7)
+ZS_EDITED_BY = "Claude - email akun: BELUM_DIISI"
+
 PAIRS = "15"
 DAYS = 60                # berapa hari yang dipelajari (maks 365)
 ZONE_TFS = "1h"          # TF tempat zona dihitung (boleh beberapa: 1h,4h)
@@ -61,6 +65,7 @@ MIN_RANGE_ATR = 0.50     # cara B: candle penilai ekor minimal 0.5 x ATR
 OB_SIZE = 5              # internal structure size (RZ_OB_SIZE bot)
 ENTRY_WARM_DAYS = 10     # hari sebelum periode untuk membiarkan zona terbentuk
 ZONE_WARM_CANDLES = 420  # candle TF zona sebelum periode (pemanasan ATR200 / pivot)
+SLOW_WARM_DAYS = 120     # hari data harian sebelum periode untuk tren lambat (EMA20/EMA50 harian, return 30 hari)
 MIN_EVENTS = 30          # di bawah ini dianggap sampel kecil (tabel tetap ditampilkan)
 MIN_OK_EVENTS = 60       # untuk lolos "konsisten": minimal kejadian (tiap paruh periode >= 30)
 OOS_T_MIN = 2.5          # t-stat minimal di paruh 2 (RR dipilih di paruh 1) -> koreksi kasar untuk banyak kombinasi yang diuji
@@ -207,6 +212,28 @@ def atr_wilder(h, l, c, n=14):
 def trend_up(closes):
     s = pd.Series(closes)
     return (s.ewm(span=50, adjust=False).mean() > s.ewm(span=200, adjust=False).mean()).values
+
+
+def slow_flags(ddf):
+    """Tren LAMBAT dari candle harian (hanya candle yang sudah close). Kembalikan (waktu_close_ms, {nama: (naik, valid)})."""
+    c = ddf["close"].values.astype(float)
+    s_ = pd.Series(c)
+    up = (s_.ewm(span=20, adjust=False).mean() > s_.ewm(span=50, adjust=False).mean()).values
+    ok_up = np.arange(len(c)) >= 50                      # EMA50 baru layak setelah 50 candle
+    roc = np.full(len(c), np.nan)
+    if len(c) > 30:
+        roc[30:] = c[30:] / c[:-30] - 1.0
+    roc_up = np.where(np.isnan(roc), False, roc > 0)
+    ok_roc = ~np.isnan(roc)
+    cms = ddf["open_ms"].values.astype("int64") + TF_MS["1d"]
+    return cms, {"d": (up, ok_up), "roc": (roc_up, ok_roc)}
+
+
+def _ctx_slow(cms, flags, ok, t_ms):
+    j = int(np.searchsorted(cms, t_ms, side="right")) - 1
+    if j < 0 or not bool(ok[j]):
+        return None
+    return bool(flags[j])
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -404,7 +431,7 @@ def _ctx_lookup(close_ms, up_flags, t_ms):
     return bool(up_flags[j])
 
 
-def study_pair(symbol, ztf, zdf, edf, btc_zdf, start_ms, args):
+def study_pair(symbol, ztf, zdf, edf, btc_zdf, start_ms, args, slow=None):
     """Kembalikan daftar kejadian (sentuhan pertama tiap zona) untuk satu pair & satu TF zona."""
     ztf_ms = TF_MS[ztf]
     eo = edf["open"].values.astype(float)
@@ -472,7 +499,7 @@ def study_pair(symbol, ztf, zdf, edf, btc_zdf, start_ms, args):
         ev = {
             "pair": symbol, "ztype": z["type"], "side": side, "ztf": ztf, "t_touch": t_touch,
             "t_zone": t_known, "lo": lo, "hi": hi, "height_atr": (hi - lo) / a0, "depth": float(min(max(depth, 0.0), 3.0)),
-            "ctx_trend": None, "ctx_btc": None, "confl": conf, "jebol_sentuh": bool(kb is not None and kb == k0), "sim": {},
+            "ctx_trend": None, "ctx_btc": None, "ctx_btc_d": None, "ctx_btc_roc": None, "ctx_pair_d": None, "confl": conf, "jebol_sentuh": bool(kb is not None and kb == k0), "sim": {},
         }
         tr = _ctx_lookup(zclose, ztrend, t_touch)
         if tr is not None:
@@ -481,6 +508,15 @@ def study_pair(symbol, ztf, zdf, edf, btc_zdf, start_ms, args):
             bt = _ctx_lookup(bclose, btrend, t_touch)
             if bt is not None:
                 ev["ctx_btc"] = "searah" if ((side == 1) == bt) else "lawan"
+        if slow:
+            for fld, key in (("ctx_btc_d", ("btc", "d")), ("ctx_btc_roc", ("btc", "roc")), ("ctx_pair_d", ("pair", "d"))):
+                src = slow.get(key[0])
+                if src is None:
+                    continue
+                cms_, fl = src
+                v = _ctx_slow(cms_, fl[key[1]][0], fl[key[1]][1], t_touch)
+                if v is not None:
+                    ev[fld] = "searah" if ((side == 1) == v) else "lawan"
         if not ev["jebol_sentuh"]:
             # cara A: langsung masuk di close candle sentuh
             ev["sim"]["A"] = simulate(side, k0, float(ec[k0]), far, float(a0), el, eh, ec, n, horizon, buf, args.rr, args.fee)
@@ -595,6 +631,61 @@ def fmt_ks(res, rr_list):
 VERDICT_TXT = {"ok": "✅ lolos uji luar-sampel", "tipis": "🟡 positif tapi belum lolos uji luar-sampel (bisa kebetulan)", "negatif": "❌ negatif", "kecil": "⚪ sampel kecil (kurang dari %d kejadian), belum bisa disimpulkan" % MIN_OK_EVENTS}
 
 
+def _mean_t(vals):
+    v = np.array(vals, dtype=float)
+    if len(v) < 2:
+        return (float(v.mean()) if len(v) else 0.0), 0.0
+    sd = float(v.std(ddof=1))
+    return float(v.mean()), (float(v.mean() / (sd / math.sqrt(len(v)))) if sd > 0 else 0.0)
+
+
+def slow_section(events, args):
+    """Bagian 4: apakah zona hanya layak dipakai SEARAH tren harian (SHORT saat turun, LONG saat naik)?"""
+    L = ["", "4) REZIM LAMBAT — apakah zona hanya layak dipakai SEARAH tren harian?",
+         "   searah = SHORT saat tren harian turun / LONG saat tren harian naik. Tren harian = EMA20 vs EMA50 candle harian (BTC dan pair itu sendiri)."]
+    evs_all = [e for e in events if e.get("ctx_btc_d") is not None and e.get("ctx_pair_d") is not None]
+    if len(evs_all) < 30:
+        L.append("   (data harian tidak tersedia / terlalu sedikit untuk bagian ini)")
+        return L
+    t0 = min(e["t_touch"] for e in evs_all)
+    for ztype in ("OB", "FVG"):
+        for mode in ("B",):
+            base = [e for e in evs_all if e["ztype"] == ztype and e["sim"].get(mode)]
+            if len(base) < 20:
+                continue
+            L.append("")
+            L.append(f"▸ {ztype} cara {mode} (n={len(base)}), expectancy dalam R:")
+            for k in (1.5, 3.0):
+                if k not in args.rr:
+                    continue
+                full = [e for e in base if e["ctx_btc_d"] == "searah" and e["ctx_pair_d"] == "searah"]
+                other = [e for e in base if not (e["ctx_btc_d"] == "searah" and e["ctx_pair_d"] == "searah")]
+                parts = []
+                for nm, sub in (("SEARAH penuh (BTC & pair)", full), ("lawan salah satu", other)):
+                    m, t = _mean_t([x["sim"][mode]["net"][k] for x in sub]) if len(sub) >= 15 else (None, 0)
+                    parts.append(f"{nm}: " + (f"{m:+.2f}R (t={t:+.1f}, n={len(sub)})" if m is not None else f"sampel kecil (n={len(sub)})"))
+                L.append(f"   RR {k:g}: " + " | ".join(parts))
+                for side in (-1, 1):
+                    sub = [e for e in full if e["side"] == side]
+                    sub2 = [e for e in other if e["side"] == side]
+                    a = _mean_t([x["sim"][mode]["net"][k] for x in sub]) if len(sub) >= 15 else None
+                    b = _mean_t([x["sim"][mode]["net"][k] for x in sub2]) if len(sub2) >= 15 else None
+                    L.append(f"      {SIDE_NAME[side]:15s} searah: " + (f"{a[0]:+.2f}R (n={len(sub)})" if a else f"n={len(sub)} kecil")
+                             + " | lawan: " + (f"{b[0]:+.2f}R (n={len(sub2)})" if b else f"n={len(sub2)} kecil"))
+            # kestabilan per blok 30 hari untuk yang searah penuh
+            full = [e for e in base if e["ctx_btc_d"] == "searah" and e["ctx_pair_d"] == "searah"]
+            blocks = {}
+            for e in full:
+                blocks.setdefault(int((e["t_touch"] - t0) // (30 * DAY_MS)), []).append(e["sim"][mode]["net"][1.5 if 1.5 in args.rr else args.rr[0]])
+            if len(blocks) >= 2:
+                L.append("   searah penuh per blok 30 hari (RR 1.5): " + " | ".join(
+                    f"blok {b + 1}: {np.mean(v):+.2f}R (n={len(v)})" for b, v in sorted(blocks.items()) if len(v) >= 5))
+    L.append("")
+    L.append("   Cara membaca: kalau 'searah penuh' positif di banyak bulan dan 'lawan' negatif, zona sebaiknya dipakai hanya searah tren harian.")
+    L.append("   Kalau keduanya mirip, zona tidak punya keunggulan sendiri dan hasilnya hanya mengikuti arah pasar.")
+    return L
+
+
 def build_report(events, args, meta):
     ver = meta.get("version", "")
     t_all = sorted(e["t_touch"] for e in events)
@@ -603,6 +694,7 @@ def build_report(events, args, meta):
     L = []
     L.append("📐 STUDI REAKSI ZONA")
     L.append("=" * 60)
+    L.append(f"zone_study {ZS_VERSION} | Diedit: {ZS_LAST_EDIT} oleh {ZS_EDITED_BY}")
     if ver:
         L.append(ver)
     L.append(f"Periode  : {meta['start']} → {meta['end']} ({args.days} hari)")
@@ -674,7 +766,9 @@ def build_report(events, args, meta):
             k = r["best"]
             evs = [e for e in G[key] if e["sim"].get(mode)]
             L.append(f"▸ {key[0]} {SIDE_NAME[key[1]]} {key[2]} cara {mode} ({k:g}R)")
-            for cname, field in (("tren zona (EMA50/200)", "ctx_trend"), ("arah BTC (EMA50/200)", "ctx_btc")):
+            for cname, field in (("tren zona (EMA50/200 1H)", "ctx_trend"), ("BTC 1H (EMA50/200)", "ctx_btc"),
+                                 ("BTC harian (EMA20/50)", "ctx_btc_d"), ("BTC 30 hari (naik/turun)", "ctx_btc_roc"),
+                                 ("pair harian (EMA20/50)", "ctx_pair_d")):
                 parts = []
                 for val in ("searah", "lawan"):
                     sub = [e["sim"][mode]["net"][k] for e in evs if e[field] == val]
@@ -683,6 +777,7 @@ def build_report(events, args, meta):
                     else:
                         parts.append(f"{val}: sampel kecil")
                 L.append(f"    {cname:<24s} " + " | ".join(parts))
+    L.extend(slow_section(events, args))
     L.append("")
     L.append("CATATAN PENTING")
     L.append(" • Kejadian dihitung SEKALI per zona (sentuhan pertama). Zona OB+FVG adalah bagian dari OB, jadi kelompok saling tumpang tindih.")
@@ -697,7 +792,7 @@ def build_report(events, args, meta):
 # ═════════════════════════════════════════════════════════════════════════════
 def write_csv(path, events, rr_list):
     cols = ["pair", "ztype", "side", "ztf", "confl", "touch_time", "zone_time", "zone_lo", "zone_hi", "height_atr", "depth_pct",
-            "ctx_trend", "ctx_btc", "jebol_sentuh"]
+            "ctx_trend", "ctx_btc", "ctx_btc_d", "ctx_btc_roc", "ctx_pair_d", "jebol_sentuh"]
     for m in ("A", "B"):
         cols += [f"{m}_ada", f"{m}_risk_pct", f"{m}_mfe_R", f"{m}_reaksi"] + [f"{m}_net_{k:g}R" for k in rr_list]
     cols += ["B_delay_candle"]
@@ -709,7 +804,8 @@ def write_csv(path, events, rr_list):
                    datetime.fromtimestamp(e["t_touch"] / 1000, timezone.utc).isoformat(),
                    datetime.fromtimestamp(e["t_zone"] / 1000, timezone.utc).isoformat(),
                    round(e["lo"], 8), round(e["hi"], 8), round(e["height_atr"], 3), round(e["depth"] * 100, 1),
-                   e["ctx_trend"] or "", e["ctx_btc"] or "", int(e["jebol_sentuh"])]
+                   e["ctx_trend"] or "", e["ctx_btc"] or "", e.get("ctx_btc_d") or "", e.get("ctx_btc_roc") or "",
+                   e.get("ctx_pair_d") or "", int(e["jebol_sentuh"])]
             for m in ("A", "B"):
                 s = e["sim"].get(m)
                 if s:
@@ -755,8 +851,22 @@ def run_study(pairs, args, get_df, start_ms, end_ms, log=print):
             btc[zt] = get_df("BTCUSDT", zt, start_ms - ZONE_WARM_CANDLES * TF_MS[zt], end_ms)
         except Exception:  # noqa: BLE001
             btc[zt] = None
+    slow_btc = None
+    try:
+        bd = get_df("BTCUSDT", "1d", start_ms - SLOW_WARM_DAYS * DAY_MS, end_ms)
+        if bd is not None and len(bd) >= 60:
+            slow_btc = slow_flags(bd)
+    except Exception:  # noqa: BLE001
+        slow_btc = None
     for i, sym in enumerate(pairs, 1):
         try:
+            slow = {"btc": slow_btc} if slow_btc else {}
+            try:
+                pdl = get_df(sym, "1d", start_ms - SLOW_WARM_DAYS * DAY_MS, end_ms)
+                if pdl is not None and len(pdl) >= 60:
+                    slow["pair"] = slow_flags(pdl)
+            except Exception:  # noqa: BLE001
+                pass
             edf = get_df(sym, args.entry_tf, start_ms - ENTRY_WARM_DAYS * DAY_MS, end_ms)
             if edf is None or len(edf) < 200:
                 log(f"⚠️ {sym}: data entry kurang, dilewati")
@@ -767,7 +877,7 @@ def run_study(pairs, args, get_df, start_ms, end_ms, log=print):
                 if zdf is None or len(zdf) < 260:
                     log(f"⚠️ {sym}@{zt}: data zona kurang, dilewati")
                     continue
-                events += study_pair(sym, zt, zdf, edf, btc.get(zt), start_ms, args)
+                events += study_pair(sym, zt, zdf, edf, btc.get(zt), start_ms, args, slow)
                 got = True
             ok_pairs += int(got)
         except Exception as e:  # noqa: BLE001
@@ -859,6 +969,7 @@ def selftest(args):
         e = synthetic_entry_df(n_entry, ent_ms, start_ms - (ENTRY_WARM_DAYS + 20) * DAY_MS, 1000 + s)
         store[(f"P{s}USDT", "30m")] = e
         store[(f"P{s}USDT", "1h")] = resample(e, 2, z_ms)
+        store[(f"P{s}USDT", "1d")] = resample(e, 48, DAY_MS)
     first_ms = start_ms - (ENTRY_WARM_DAYS + 20) * DAY_MS
     end_ms = first_ms + n_entry * ent_ms
 
